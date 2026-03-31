@@ -10,9 +10,17 @@ import (
 	"github.com/ledatu/csar-core/httpx"
 )
 
-// HTTPHandler serves POST /ingest with a JSON audit.Event body.
+type submitter interface {
+	Submit(*audit.Event) error
+}
+
+type httpIngestBody struct {
+	Events []*audit.Event `json:"events"`
+}
+
+// HTTPHandler serves POST /ingest with a JSON batch body.
 type HTTPHandler struct {
-	buf    *pipeline.Buffer
+	buf    submitter
 	logger *slog.Logger
 }
 
@@ -24,21 +32,35 @@ func NewHTTPHandler(buf *pipeline.Buffer, logger *slog.Logger) *HTTPHandler {
 	return &HTTPHandler{buf: buf, logger: logger.With("component", "audit_ingest_http")}
 }
 
-// ServeHTTP validates the JSON body, enqueues the event, and returns 202 Accepted.
+// ServeHTTP validates the JSON batch, enqueues the events, and returns 202 Accepted.
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var body audit.Event
+	var body httpIngestBody
 	if err := httpx.ReadJSON(r, &body); err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
-	if err := Validate(&body); err != nil {
-		httpx.WriteError(w, csarerrors.Validation("%v", err))
+	if len(body.Events) == 0 {
+		httpx.WriteError(w, csarerrors.Validation("events required"))
 		return
 	}
-	if err := h.buf.Submit(&body); err != nil {
-		h.logger.Warn("audit ingest buffer full", "action", body.Action)
-		httpx.WriteError(w, csarerrors.Unavailable("audit ingest buffer full"))
-		return
+
+	for _, event := range body.Events {
+		if err := Validate(event); err != nil {
+			httpx.WriteError(w, csarerrors.Validation("%v", err))
+			return
+		}
 	}
-	httpx.WriteJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
+
+	for idx, event := range body.Events {
+		if err := h.buf.Submit(event); err != nil {
+			h.logger.Warn("audit ingest buffer full", "action", event.Action, "accepted", idx, "total", len(body.Events))
+			httpx.WriteError(w, csarerrors.Unavailable("audit ingest buffer full after %d of %d events", idx, len(body.Events)))
+			return
+		}
+	}
+
+	httpx.WriteJSON(w, http.StatusAccepted, map[string]any{
+		"status":   "accepted",
+		"accepted": len(body.Events),
+	})
 }
