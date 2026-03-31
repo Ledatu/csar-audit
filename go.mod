@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/jackc/pgx/v5 v5.8.0
-	github.com/ledatu/csar-core v0.1.18
+	github.com/ledatu/csar-core v0.1.19
 	github.com/ledatu/csar-proto v0.1.3
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rabbitmq/amqp091-go v1.10.0
@@ -59,7 +59,3 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
-
-replace github.com/ledatu/csar-core => ../csar-core
-
-replace github.com/ledatu/csar-proto => ../csar-proto
