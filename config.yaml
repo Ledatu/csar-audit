@@ -1,0 +1,42 @@
+service:
+  name: csar-audit
+  port: 8083
+  health_port: 9083
+
+# Leave tls empty for local plain HTTP / optional mTLS in production.
+tls: {}
+
+grpc:
+  port: 9084
+  tls: {}
+  reflection: true
+
+database:
+  dsn: "${AUDIT_DATABASE_URL}"
+
+rabbitmq:
+  url: "${RABBITMQ_URL}"
+  reconnect_delay: 5s
+
+ingest:
+  buffer_size: 10000
+  publisher_workers: 4
+
+consumer:
+  queue:
+    name: audit.events
+    durable: true
+    prefetch: 200
+  dlq:
+    name: audit.events.dlq
+    durable: true
+  batch_size: 200
+  flush_interval: 2s
+  max_redeliveries: 3
+
+http:
+  allowed_client_cn: ""
+
+tracing:
+  endpoint: "${OTEL_EXPORTER_OTLP_ENDPOINT}"
+  sample_ratio: 1.0
