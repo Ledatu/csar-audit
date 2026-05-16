@@ -27,9 +27,11 @@ consumer:
     name: audit.events
     durable: true
     prefetch: 200
+    type: quorum
   dlq:
     name: audit.events.dlq
     durable: true
+    type: quorum
   batch_size: 200
   flush_interval: 2s
   max_redeliveries: 3

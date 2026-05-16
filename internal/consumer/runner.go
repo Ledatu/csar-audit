@@ -63,10 +63,7 @@ func runSession(ctx context.Context, cm *rmq.ConnectionManager, st BatchInserter
 		Name:     ccfg.Queue.Name,
 		Durable:  ccfg.Queue.Durable,
 		Prefetch: ccfg.Queue.Prefetch,
-		Args: amqp091.Table{
-			"x-dead-letter-exchange":    "",
-			"x-dead-letter-routing-key": ccfg.DLQ.Name,
-		},
+		Type:     ccfg.Queue.Type,
 	}
 
 	sess, err := rmq.OpenConsumerSession(ctx, cm, queueCfg)

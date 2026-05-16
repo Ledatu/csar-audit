@@ -8,6 +8,20 @@ import (
 	amqp091 "github.com/rabbitmq/amqp091-go"
 )
 
+func TestQueueDeclareArgsQuorumPreservesExtraArgs(t *testing.T) {
+	t.Parallel()
+
+	args := QueueDeclareArgs(QueueTypeQuorum, amqp091.Table{
+		"custom": "value",
+	})
+	if got := args["x-queue-type"]; got != QueueTypeQuorum {
+		t.Fatalf("x-queue-type=%v want %s", got, QueueTypeQuorum)
+	}
+	if got := args["custom"]; got != "value" {
+		t.Fatalf("custom=%v want value", got)
+	}
+}
+
 func TestCollectBatch_maxOne(t *testing.T) {
 	t.Parallel()
 	ch := make(chan amqp091.Delivery, 2)

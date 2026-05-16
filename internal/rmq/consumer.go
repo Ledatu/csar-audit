@@ -11,13 +11,29 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
+const QueueTypeQuorum = "quorum"
+
 // QueueConfig describes the queue to consume from.
 type QueueConfig struct {
 	Name     string
 	Durable  bool
 	Prefetch int
+	Type     string
 	// Args is passed to QueueDeclare (e.g. x-dead-letter-exchange).
 	Args amqp091.Table
+}
+
+// QueueDeclareArgs returns QueueDeclare arguments for the configured queue type,
+// preserving any caller-provided queue arguments.
+func QueueDeclareArgs(queueType string, extra amqp091.Table) amqp091.Table {
+	args := amqp091.Table{}
+	for k, v := range extra {
+		args[k] = v
+	}
+	if queueType == QueueTypeQuorum {
+		args["x-queue-type"] = QueueTypeQuorum
+	}
+	return args
 }
 
 // ConsumerSession holds an active consume channel and the delivery stream.
@@ -33,10 +49,7 @@ func OpenConsumerSession(ctx context.Context, cm *ConnectionManager, cfg QueueCo
 		return nil, fmt.Errorf("open channel: %w", err)
 	}
 
-	args := cfg.Args
-	if args == nil {
-		args = amqp091.Table{}
-	}
+	args := QueueDeclareArgs(cfg.Type, cfg.Args)
 
 	_, err = ch.QueueDeclare(
 		cfg.Name,

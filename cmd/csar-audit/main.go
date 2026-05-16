@@ -111,8 +111,8 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 	}
 	defer func() { _ = cm.Close() }()
 
-	if err := declareDLQ(cm, cfg.Consumer.DLQ.Name); err != nil {
-		return fmt.Errorf("declare rabbitmq dlq: %w", err)
+	if err := declareAuditQueues(cm, cfg.Consumer.Queue, cfg.Consumer.DLQ); err != nil {
+		return fmt.Errorf("declare rabbitmq queues: %w", err)
 	}
 
 	pub := rmq.NewPublisher(cm, cfg.Consumer.Queue.Name)
@@ -303,15 +303,21 @@ func buildTrustFunc(cfg *config.Config) gatewayctx.TrustFunc {
 	}
 }
 
-func declareDLQ(cm *rmq.ConnectionManager, dlq string) error {
+func declareAuditQueues(cm *rmq.ConnectionManager, queue config.ConsumerQueueConfig, dlq config.ConsumerDLQConfig) error {
 	ch, err := cm.Channel()
 	if err != nil {
 		return err
 	}
 	defer ch.Close()
 
-	if _, err := ch.QueueDeclare(dlq, true, false, false, false, nil); err != nil {
-		return fmt.Errorf("declare dlq: %w", err)
+	queueArgs := rmq.QueueDeclareArgs(queue.Type, nil)
+	if _, err := ch.QueueDeclare(queue.Name, queue.Durable, false, false, false, queueArgs); err != nil {
+		return fmt.Errorf("declare queue %s: %w", queue.Name, err)
+	}
+
+	dlqArgs := rmq.QueueDeclareArgs(dlq.Type, nil)
+	if _, err := ch.QueueDeclare(dlq.Name, dlq.Durable, false, false, false, dlqArgs); err != nil {
+		return fmt.Errorf("declare dlq %s: %w", dlq.Name, err)
 	}
 	return nil
 }

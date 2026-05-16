@@ -77,12 +77,14 @@ type ConsumerQueueConfig struct {
 	Name     string `yaml:"name"`
 	Durable  bool   `yaml:"durable"`
 	Prefetch int    `yaml:"prefetch"`
+	Type     string `yaml:"type"`
 }
 
 // ConsumerDLQConfig is the dead-letter queue for poison messages.
 type ConsumerDLQConfig struct {
 	Name    string `yaml:"name"`
 	Durable bool   `yaml:"durable"`
+	Type    string `yaml:"type"`
 }
 
 // HTTPExtraConfig augments HTTP server behavior (mTLS gateway verification).
@@ -132,11 +134,23 @@ func defaults(cfg *Config) {
 	if cfg.Consumer.Queue.Name == "" {
 		cfg.Consumer.Queue.Name = "audit.events"
 	}
+	if !cfg.Consumer.Queue.Durable {
+		cfg.Consumer.Queue.Durable = true
+	}
 	if cfg.Consumer.Queue.Prefetch == 0 {
 		cfg.Consumer.Queue.Prefetch = 200
 	}
+	if cfg.Consumer.Queue.Type == "" {
+		cfg.Consumer.Queue.Type = "quorum"
+	}
 	if cfg.Consumer.DLQ.Name == "" {
 		cfg.Consumer.DLQ.Name = "audit.events.dlq"
+	}
+	if !cfg.Consumer.DLQ.Durable {
+		cfg.Consumer.DLQ.Durable = true
+	}
+	if cfg.Consumer.DLQ.Type == "" {
+		cfg.Consumer.DLQ.Type = "quorum"
 	}
 	if cfg.Consumer.BatchSize == 0 {
 		cfg.Consumer.BatchSize = 200
@@ -164,6 +178,12 @@ func (c *Config) validate() error {
 	}
 	if c.Consumer.BatchSize < 1 {
 		return fmt.Errorf("consumer.batch_size must be >= 1")
+	}
+	if c.Consumer.Queue.Type != "quorum" {
+		return fmt.Errorf("consumer.queue.type must be quorum")
+	}
+	if c.Consumer.DLQ.Type != "quorum" {
+		return fmt.Errorf("consumer.dlq.type must be quorum")
 	}
 	return nil
 }
