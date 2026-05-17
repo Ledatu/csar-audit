@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/ledatu/csar-audit/internal/store"
-	"github.com/ledatu/csar-core/audit"
 	csarerrors "github.com/ledatu/csar-core/errors"
 	"github.com/ledatu/csar-core/gatewayctx"
 	"github.com/ledatu/csar-core/httpx"
@@ -16,8 +15,8 @@ import (
 
 // Lister is the read interface satisfied by store.Postgres.
 type Lister interface {
-	List(ctx context.Context, filter *audit.ListFilter) (*audit.ListResult, error)
-	ListGroups(ctx context.Context, filter *audit.ListFilter) (*store.GroupResult, error)
+	List(ctx context.Context, filter *store.ListFilter) (*store.ListResult, error)
+	ListGroups(ctx context.Context, filter *store.ListFilter) (*store.GroupResult, error)
 }
 
 // Handler serves GET /admin/audit. Authorization is enforced by the router (x-csar-authz);
@@ -70,7 +69,7 @@ func (h *Handler) handleGroups(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, result)
 }
 
-func (h *Handler) parseFilter(w http.ResponseWriter, r *http.Request) (*audit.ListFilter, bool) {
+func (h *Handler) parseFilter(w http.ResponseWriter, r *http.Request) (*store.ListFilter, bool) {
 	id, _ := gatewayctx.FromContext(r.Context())
 	if id.Subject == "" {
 		httpx.WriteError(w, csarerrors.Unauthorized("not authenticated"))
@@ -82,7 +81,7 @@ func (h *Handler) parseFilter(w http.ResponseWriter, r *http.Request) (*audit.Li
 	}
 
 	q := r.URL.Query()
-	filter := audit.ListFilter{
+	filter := store.ListFilter{
 		ScopeType:         q.Get("scope_type"),
 		ScopeID:           q.Get("scope_id"),
 		Service:           q.Get("service"),
@@ -93,9 +92,9 @@ func (h *Handler) parseFilter(w http.ResponseWriter, r *http.Request) (*audit.Li
 		RequestID:         q.Get("request_id"),
 		Category:          q.Get("category"),
 		Cursor:            q.Get("cursor"),
-		ExcludeCategories: getListParam(q, "exclude_category", "exclude_categories"),
-		ExcludeServices:   getListParam(q, "exclude_service", "exclude_services"),
-		ExcludeActions:    getListParam(q, "exclude_action", "exclude_actions"),
+		ExcludeCategories: getListParam(q, "exclude_category", "exclude_category[]", "exclude_categories"),
+		ExcludeServices:   getListParam(q, "exclude_service", "exclude_service[]", "exclude_services"),
+		ExcludeActions:    getListParam(q, "exclude_action", "exclude_action[]", "exclude_actions"),
 	}
 
 	if v := q.Get("limit"); v != "" {

@@ -21,8 +21,8 @@ type BatchInserter interface {
 
 // Lister is the read interface used by the query handler.
 type Lister interface {
-	List(ctx context.Context, filter *audit.ListFilter) (*audit.ListResult, error)
-	ListGroups(ctx context.Context, filter *audit.ListFilter) (*GroupResult, error)
+	List(ctx context.Context, filter *ListFilter) (*ListResult, error)
+	ListGroups(ctx context.Context, filter *ListFilter) (*GroupResult, error)
 }
 
 const copyFromThreshold = 50
@@ -112,9 +112,58 @@ func (s *Postgres) Migrate(ctx context.Context) error {
 	return pgutil.RunMigrations(ctx, s.pool, "audit_service_migrations", migrations, s.logger)
 }
 
+// Event is the csar-audit query response shape. It mirrors audit.Event and adds
+// derived fields that are local to the query surface.
+type Event struct {
+	ID          string          `json:"id"`
+	Service     string          `json:"service,omitempty"`
+	Category    string          `json:"category,omitempty"`
+	Actor       string          `json:"actor"`
+	Action      string          `json:"action"`
+	TargetType  string          `json:"target_type"`
+	TargetID    string          `json:"target_id"`
+	ScopeType   string          `json:"scope_type"`
+	ScopeID     string          `json:"scope_id"`
+	BeforeState json.RawMessage `json:"before_state,omitempty"`
+	AfterState  json.RawMessage `json:"after_state,omitempty"`
+	Metadata    json.RawMessage `json:"metadata,omitempty"`
+	RequestID   string          `json:"request_id,omitempty"`
+	ClientIP    string          `json:"client_ip,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+// ListFilter specifies query parameters for listing audit events.
+type ListFilter struct {
+	ScopeType         string
+	ScopeID           string
+	Service           string
+	Actor             string
+	Action            string
+	Category          string
+	TargetType        string
+	TargetID          string
+	RequestID         string
+	ExcludeCategories []string
+	ExcludeServices   []string
+	ExcludeActions    []string
+	StatusMin         int
+	StatusMax         int
+	Since             *time.Time
+	Until             *time.Time
+	Cursor            string
+	Limit             int
+}
+
+// ListResult holds a page of audit events with an optional next cursor.
+type ListResult struct {
+	Events     []Event `json:"events"`
+	NextCursor string  `json:"next_cursor,omitempty"`
+}
+
 // Group summarizes similar audit events for investigation views without
 // replacing the raw append-only event trail.
 type Group struct {
+	BucketStart  time.Time `json:"bucket_start"`
 	Category     string    `json:"category"`
 	Service      string    `json:"service,omitempty"`
 	Actor        string    `json:"actor"`
@@ -240,7 +289,7 @@ func (b *whereBuilder) addNotIn(column string, values []string) {
 	b.clauses = append(b.clauses, fmt.Sprintf("%s NOT IN (%s)", column, strings.Join(placeholders, ", ")))
 }
 
-func (b *whereBuilder) addTimeRange(filter *audit.ListFilter) {
+func (b *whereBuilder) addTimeRange(filter *ListFilter) {
 	if filter.Since != nil {
 		b.clauses = append(b.clauses, fmt.Sprintf("created_at >= %s", b.nextArg(*filter.Since)))
 	}
@@ -249,7 +298,7 @@ func (b *whereBuilder) addTimeRange(filter *audit.ListFilter) {
 	}
 }
 
-func (b *whereBuilder) addStatusRange(filter *audit.ListFilter) {
+func (b *whereBuilder) addStatusRange(filter *ListFilter) {
 	if filter.StatusMin <= 0 && filter.StatusMax <= 0 {
 		return
 	}
@@ -315,9 +364,9 @@ func limitOrDefault(limit int) int {
 	return limit
 }
 
-func buildWhere(filter *audit.ListFilter, includeCursor bool) (string, []any) {
+func buildWhere(filter *ListFilter, includeCursor bool) (string, []any) {
 	if filter == nil {
-		filter = &audit.ListFilter{}
+		filter = &ListFilter{}
 	}
 	categoryColumn := categoryColumnSQL()
 	builder := whereBuilder{}
@@ -342,9 +391,9 @@ func buildWhere(filter *audit.ListFilter, includeCursor bool) (string, []any) {
 }
 
 // List returns a page of audit events using the same cursor contract as audit.PostgresStore.
-func (s *Postgres) List(ctx context.Context, filter *audit.ListFilter) (*audit.ListResult, error) {
+func (s *Postgres) List(ctx context.Context, filter *ListFilter) (*ListResult, error) {
 	if filter == nil {
-		filter = &audit.ListFilter{}
+		filter = &ListFilter{}
 	}
 	limit := limitOrDefault(filter.Limit)
 
@@ -361,9 +410,9 @@ func (s *Postgres) List(ctx context.Context, filter *audit.ListFilter) (*audit.L
 	}
 	defer rows.Close()
 
-	var events []audit.Event
+	var events []Event
 	for rows.Next() {
-		var e audit.Event
+		var e Event
 		if err := rows.Scan(&e.ID, &e.Service, &e.Category, &e.Actor, &e.Action, &e.TargetType, &e.TargetID,
 			&e.ScopeType, &e.ScopeID, &e.BeforeState, &e.AfterState, &e.Metadata,
 			&e.RequestID, &e.ClientIP, &e.CreatedAt); err != nil {
@@ -375,7 +424,7 @@ func (s *Postgres) List(ctx context.Context, filter *audit.ListFilter) (*audit.L
 		return nil, err
 	}
 
-	result := &audit.ListResult{}
+	result := &ListResult{}
 	if len(events) > limit {
 		events = events[:limit]
 		last := events[len(events)-1]
@@ -386,19 +435,20 @@ func (s *Postgres) List(ctx context.Context, filter *audit.ListFilter) (*audit.L
 }
 
 // ListGroups returns grouped audit rows for high-volume investigation views.
-func (s *Postgres) ListGroups(ctx context.Context, filter *audit.ListFilter) (*GroupResult, error) {
+func (s *Postgres) ListGroups(ctx context.Context, filter *ListFilter) (*GroupResult, error) {
 	if filter == nil {
-		filter = &audit.ListFilter{}
+		filter = &ListFilter{}
 	}
 	limit := limitOrDefault(filter.Limit)
 	whereSQL, args := buildWhere(filter, false)
-	query := `SELECT ` + auditCategoryExpr + ` AS category, service, actor, action, target_type, target_id,
+	query := `SELECT date_trunc('hour', created_at) AS bucket_start,
+	                  ` + auditCategoryExpr + ` AS category, service, actor, action, target_type, target_id,
 	                  scope_type, scope_id, COUNT(*) AS count,
 	                  COUNT(*) FILTER (WHERE (metadata->>'http_status') ~ '^[0-9]+$' AND (metadata->>'http_status')::int BETWEEN 200 AND 399) AS success_count,
 	                  COUNT(*) FILTER (WHERE (metadata->>'http_status') ~ '^[0-9]+$' AND (metadata->>'http_status')::int >= 400) AS failure_count,
 	                  MIN(created_at) AS first_seen, MAX(created_at) AS last_seen
 	           FROM audit_events` + whereSQL + `
-	           GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+	           GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9
 	           ORDER BY MAX(created_at) DESC
 	           LIMIT $` + fmt.Sprint(len(args)+1)
 	args = append(args, limit)
@@ -412,7 +462,7 @@ func (s *Postgres) ListGroups(ctx context.Context, filter *audit.ListFilter) (*G
 	var groups []Group
 	for rows.Next() {
 		var g Group
-		if err := rows.Scan(&g.Category, &g.Service, &g.Actor, &g.Action, &g.TargetType, &g.TargetID,
+		if err := rows.Scan(&g.BucketStart, &g.Category, &g.Service, &g.Actor, &g.Action, &g.TargetType, &g.TargetID,
 			&g.ScopeType, &g.ScopeID, &g.Count, &g.SuccessCount, &g.FailureCount, &g.FirstSeen, &g.LastSeen); err != nil {
 			return nil, fmt.Errorf("scanning audit group: %w", err)
 		}
