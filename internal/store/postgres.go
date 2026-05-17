@@ -22,9 +22,19 @@ type BatchInserter interface {
 // Lister is the read interface used by the query handler.
 type Lister interface {
 	List(ctx context.Context, filter *audit.ListFilter) (*audit.ListResult, error)
+	ListGroups(ctx context.Context, filter *audit.ListFilter) (*GroupResult, error)
 }
 
 const copyFromThreshold = 50
+
+const auditCategoryExpr = `CASE
+WHEN service = 'csar-router' AND action LIKE 'GET /admin/audit%' THEN 'sensitive_read'
+WHEN service = 'csar-router' THEN 'router_access'
+WHEN action ~ '(^|\.)((authn|authz|sts|role|permission|service_account|session|user|security|credentials)\.|.*\.(assign|revoke|rotate|disable|enable|lock|unlock|merge|link|unlink)$)' THEN 'security_change'
+WHEN action ~ '\.(create|update|delete|cancel|confirm|redeem|bootstrap|change|archive|start|stop|purge|reset|resolve|escalate)$' THEN 'business_mutation'
+WHEN action ~ '\.(read|list|view|export|download)$' THEN 'sensitive_read'
+ELSE 'system'
+END`
 
 var migrations = []pgutil.Migration{
 	{
@@ -102,6 +112,29 @@ func (s *Postgres) Migrate(ctx context.Context) error {
 	return pgutil.RunMigrations(ctx, s.pool, "audit_service_migrations", migrations, s.logger)
 }
 
+// Group summarizes similar audit events for investigation views without
+// replacing the raw append-only event trail.
+type Group struct {
+	Category     string    `json:"category"`
+	Service      string    `json:"service,omitempty"`
+	Actor        string    `json:"actor"`
+	Action       string    `json:"action"`
+	TargetType   string    `json:"target_type"`
+	TargetID     string    `json:"target_id"`
+	ScopeType    string    `json:"scope_type"`
+	ScopeID      string    `json:"scope_id"`
+	Count        int64     `json:"count"`
+	SuccessCount int64     `json:"success_count"`
+	FailureCount int64     `json:"failure_count"`
+	FirstSeen    time.Time `json:"first_seen"`
+	LastSeen     time.Time `json:"last_seen"`
+}
+
+// GroupResult is returned by the grouped investigation endpoint.
+type GroupResult struct {
+	Groups []Group `json:"groups"`
+}
+
 // BatchInsert writes all events in a single database round-trip.
 func (s *Postgres) BatchInsert(ctx context.Context, events []audit.Event) error {
 	if len(events) == 0 {
@@ -177,82 +210,149 @@ func (s *Postgres) batchInsertCopyFrom(ctx context.Context, events []audit.Event
 	return nil
 }
 
+type whereBuilder struct {
+	clauses []string
+	args    []any
+}
+
+func (b *whereBuilder) nextArg(value any) string {
+	b.args = append(b.args, value)
+	return fmt.Sprintf("$%d", len(b.args))
+}
+
+func (b *whereBuilder) addEqual(column string, value string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return
+	}
+	b.clauses = append(b.clauses, fmt.Sprintf("%s = %s", column, b.nextArg(value)))
+}
+
+func (b *whereBuilder) addNotIn(column string, values []string) {
+	cleaned := cleanFilterValues(values)
+	if len(cleaned) == 0 {
+		return
+	}
+	placeholders := make([]string, 0, len(cleaned))
+	for _, value := range cleaned {
+		placeholders = append(placeholders, b.nextArg(value))
+	}
+	b.clauses = append(b.clauses, fmt.Sprintf("%s NOT IN (%s)", column, strings.Join(placeholders, ", ")))
+}
+
+func (b *whereBuilder) addTimeRange(filter *audit.ListFilter) {
+	if filter.Since != nil {
+		b.clauses = append(b.clauses, fmt.Sprintf("created_at >= %s", b.nextArg(*filter.Since)))
+	}
+	if filter.Until != nil {
+		b.clauses = append(b.clauses, fmt.Sprintf("created_at <= %s", b.nextArg(*filter.Until)))
+	}
+}
+
+func (b *whereBuilder) addStatusRange(filter *audit.ListFilter) {
+	if filter.StatusMin <= 0 && filter.StatusMax <= 0 {
+		return
+	}
+	b.clauses = append(b.clauses, "(metadata->>'http_status') ~ '^[0-9]+$'")
+	if filter.StatusMin > 0 {
+		b.clauses = append(b.clauses, fmt.Sprintf("(metadata->>'http_status')::int >= %s", b.nextArg(filter.StatusMin)))
+	}
+	if filter.StatusMax > 0 {
+		b.clauses = append(b.clauses, fmt.Sprintf("(metadata->>'http_status')::int <= %s", b.nextArg(filter.StatusMax)))
+	}
+}
+
+func (b *whereBuilder) addCursor(cursor string) {
+	if cursor == "" {
+		return
+	}
+	cursorTime, cursorID, err := audit.DecodeListCursor(cursor)
+	if err != nil {
+		return
+	}
+	timeArg := b.nextArg(cursorTime)
+	idArg := b.nextArg(cursorID)
+	b.clauses = append(b.clauses, fmt.Sprintf("(created_at < %s OR (created_at = %s AND id < %s))", timeArg, timeArg, idArg))
+}
+
+func (b *whereBuilder) whereSQL() string {
+	if len(b.clauses) == 0 {
+		return " WHERE 1=1"
+	}
+	return " WHERE 1=1 AND " + strings.Join(b.clauses, " AND ")
+}
+
+func categoryColumnSQL() string {
+	return "(" + auditCategoryExpr + ")"
+}
+
+func cleanFilterValues(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	cleaned := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if _, ok := seen[part]; ok {
+				continue
+			}
+			seen[part] = struct{}{}
+			cleaned = append(cleaned, part)
+		}
+	}
+	return cleaned
+}
+
+func limitOrDefault(limit int) int {
+	if limit <= 0 || limit > 100 {
+		return 50
+	}
+	return limit
+}
+
+func buildWhere(filter *audit.ListFilter, includeCursor bool) (string, []any) {
+	if filter == nil {
+		filter = &audit.ListFilter{}
+	}
+	categoryColumn := categoryColumnSQL()
+	builder := whereBuilder{}
+	builder.addEqual("service", filter.Service)
+	builder.addEqual("scope_type", filter.ScopeType)
+	builder.addEqual("scope_id", filter.ScopeID)
+	builder.addEqual("actor", filter.Actor)
+	builder.addEqual("action", filter.Action)
+	builder.addEqual(categoryColumn, filter.Category)
+	builder.addEqual("target_type", filter.TargetType)
+	builder.addEqual("target_id", filter.TargetID)
+	builder.addEqual("request_id", filter.RequestID)
+	builder.addNotIn(categoryColumn, filter.ExcludeCategories)
+	builder.addNotIn("service", filter.ExcludeServices)
+	builder.addNotIn("action", filter.ExcludeActions)
+	builder.addStatusRange(filter)
+	builder.addTimeRange(filter)
+	if includeCursor {
+		builder.addCursor(filter.Cursor)
+	}
+	return builder.whereSQL(), builder.args
+}
+
 // List returns a page of audit events using the same cursor contract as audit.PostgresStore.
 func (s *Postgres) List(ctx context.Context, filter *audit.ListFilter) (*audit.ListResult, error) {
 	if filter == nil {
 		filter = &audit.ListFilter{}
 	}
-	limit := filter.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 50
-	}
+	limit := limitOrDefault(filter.Limit)
 
-	query := `SELECT id, service, actor, action, target_type, target_id, scope_type, scope_id,
+	whereSQL, args := buildWhere(filter, true)
+	query := `SELECT id, service, ` + auditCategoryExpr + ` AS category, actor, action, target_type, target_id, scope_type, scope_id,
 	                  before_state, after_state, metadata, request_id, client_ip, created_at
-	           FROM audit_events WHERE 1=1`
-	args := []any{}
-	idx := 1
-
-	if filter.Service != "" {
-		query += fmt.Sprintf(" AND service = $%d", idx)
-		args = append(args, filter.Service)
-		idx++
-	}
-	if filter.ScopeType != "" {
-		query += fmt.Sprintf(" AND scope_type = $%d", idx)
-		args = append(args, filter.ScopeType)
-		idx++
-	}
-	if filter.ScopeID != "" {
-		query += fmt.Sprintf(" AND scope_id = $%d", idx)
-		args = append(args, filter.ScopeID)
-		idx++
-	}
-	if filter.Actor != "" {
-		query += fmt.Sprintf(" AND actor = $%d", idx)
-		args = append(args, filter.Actor)
-		idx++
-	}
-	if filter.Action != "" {
-		query += fmt.Sprintf(" AND action = $%d", idx)
-		args = append(args, filter.Action)
-		idx++
-	}
-	if filter.TargetType != "" {
-		query += fmt.Sprintf(" AND target_type = $%d", idx)
-		args = append(args, filter.TargetType)
-		idx++
-	}
-	if filter.TargetID != "" {
-		query += fmt.Sprintf(" AND target_id = $%d", idx)
-		args = append(args, filter.TargetID)
-		idx++
-	}
-	if filter.RequestID != "" {
-		query += fmt.Sprintf(" AND request_id = $%d", idx)
-		args = append(args, filter.RequestID)
-		idx++
-	}
-	if filter.Since != nil {
-		query += fmt.Sprintf(" AND created_at >= $%d", idx)
-		args = append(args, *filter.Since)
-		idx++
-	}
-	if filter.Until != nil {
-		query += fmt.Sprintf(" AND created_at <= $%d", idx)
-		args = append(args, *filter.Until)
-		idx++
-	}
-	if filter.Cursor != "" {
-		if cursorTime, cursorID, err := audit.DecodeListCursor(filter.Cursor); err == nil {
-			query += fmt.Sprintf(" AND (created_at < $%d OR (created_at = $%d AND id < $%d))",
-				idx, idx, idx+1)
-			args = append(args, cursorTime, cursorID)
-			idx += 2
-		}
-	}
-
-	query += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d", idx)
+	           FROM audit_events` + whereSQL
+	query += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d", len(args)+1)
 	args = append(args, limit+1)
 
 	rows, err := s.pool.Query(ctx, query, args...)
@@ -264,7 +364,7 @@ func (s *Postgres) List(ctx context.Context, filter *audit.ListFilter) (*audit.L
 	var events []audit.Event
 	for rows.Next() {
 		var e audit.Event
-		if err := rows.Scan(&e.ID, &e.Service, &e.Actor, &e.Action, &e.TargetType, &e.TargetID,
+		if err := rows.Scan(&e.ID, &e.Service, &e.Category, &e.Actor, &e.Action, &e.TargetType, &e.TargetID,
 			&e.ScopeType, &e.ScopeID, &e.BeforeState, &e.AfterState, &e.Metadata,
 			&e.RequestID, &e.ClientIP, &e.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scanning audit event: %w", err)
@@ -283,6 +383,45 @@ func (s *Postgres) List(ctx context.Context, filter *audit.ListFilter) (*audit.L
 	}
 	result.Events = events
 	return result, nil
+}
+
+// ListGroups returns grouped audit rows for high-volume investigation views.
+func (s *Postgres) ListGroups(ctx context.Context, filter *audit.ListFilter) (*GroupResult, error) {
+	if filter == nil {
+		filter = &audit.ListFilter{}
+	}
+	limit := limitOrDefault(filter.Limit)
+	whereSQL, args := buildWhere(filter, false)
+	query := `SELECT ` + auditCategoryExpr + ` AS category, service, actor, action, target_type, target_id,
+	                  scope_type, scope_id, COUNT(*) AS count,
+	                  COUNT(*) FILTER (WHERE (metadata->>'http_status') ~ '^[0-9]+$' AND (metadata->>'http_status')::int BETWEEN 200 AND 399) AS success_count,
+	                  COUNT(*) FILTER (WHERE (metadata->>'http_status') ~ '^[0-9]+$' AND (metadata->>'http_status')::int >= 400) AS failure_count,
+	                  MIN(created_at) AS first_seen, MAX(created_at) AS last_seen
+	           FROM audit_events` + whereSQL + `
+	           GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+	           ORDER BY MAX(created_at) DESC
+	           LIMIT $` + fmt.Sprint(len(args)+1)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("grouping audit events: %w", err)
+	}
+	defer rows.Close()
+
+	var groups []Group
+	for rows.Next() {
+		var g Group
+		if err := rows.Scan(&g.Category, &g.Service, &g.Actor, &g.Action, &g.TargetType, &g.TargetID,
+			&g.ScopeType, &g.ScopeID, &g.Count, &g.SuccessCount, &g.FailureCount, &g.FirstSeen, &g.LastSeen); err != nil {
+			return nil, fmt.Errorf("scanning audit group: %w", err)
+		}
+		groups = append(groups, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return &GroupResult{Groups: groups}, nil
 }
 
 func nullableJSON(data json.RawMessage) any {
