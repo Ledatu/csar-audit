@@ -8,6 +8,11 @@ import (
 	auditv1 "github.com/ledatu/csar-proto/csar/audit/v1"
 )
 
+const (
+	maxBeforeStateBytes = 64 * 1024
+	maxMetadataBytes    = 16 * 1024
+)
+
 // Validate checks mandatory audit fields.
 func Validate(e *audit.Event) error {
 	if e == nil {
@@ -24,6 +29,12 @@ func Validate(e *audit.Event) error {
 	}
 	if e.ScopeType == "" {
 		return fmt.Errorf("scope_type is required")
+	}
+	if len(e.BeforeState) > maxBeforeStateBytes {
+		return fmt.Errorf("before_state exceeds %d bytes", maxBeforeStateBytes)
+	}
+	if len(e.Metadata) > maxMetadataBytes {
+		return fmt.Errorf("metadata exceeds %d bytes", maxMetadataBytes)
 	}
 	return nil
 }
