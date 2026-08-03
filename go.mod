@@ -3,8 +3,8 @@ module github.com/ledatu/csar-audit
 go 1.25.0
 
 require (
-	github.com/jackc/pgx/v5 v5.9.2
-	github.com/ledatu/csar-core v0.1.34
+	github.com/jackc/pgx/v5 v5.10.0
+	github.com/ledatu/csar-core v0.1.36
 	github.com/ledatu/csar-proto v0.1.4
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rabbitmq/amqp091-go v1.10.0
