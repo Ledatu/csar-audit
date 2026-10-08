@@ -289,24 +289,63 @@ row count, SHA256 for both byte streams, event-ID coverage and timestamp bounds.
 `Restore` verifies the entire pinned manifest/chunk before returning any rows.
 It does not import a database, expose a public archive endpoint or authorize deletion.
 
-A PostgreSQL planning transaction records fixed event membership and a stable job
-UUID. One 180s lease coordinates replicas; SQL planning is bounded to 15s and the
-whole job to 150s. Events with known receipts become eligible after one hour;
-historical NULL receipts are eligible for backfill. Membership selection catches
-old-timestamp events committed after earlier jobs. Jobs persist `planned` until
-both objects are verified, then atomically become `catalogued`. Export/verification
-are IO phases, never trusted catalog progress on their own. A stale worker cannot
-finish another lease. Failed/lost receipts replay the same membership/key; conditional
-PUT reuses existing versions and rechecks bytes. Conflicting existing bytes stop progress.
-The worker waits at least one second between completed batches and 30s while idle/failing.
+A transaction-local insert trigger adds each committed event to a durable pending
+queue, including inserts from older ingest images and COPY writers. Exact replay
+and rollback do not increment its counters. Known receipts become eligible after
+one hour; historical NULL receipts are immediately eligible. Selection first
+materializes at most200 eligible queue IDs through an ordered partial index, then
+fetches payloads and applies the existing32MiB budget. It never anti-joins the
+entire retained event table to find the next batch.
 
-`audit_archive_pending_events`, `audit_archive_oldest_age_seconds` and
-`audit_archive_scrape_success` expose lag, including planned-but-unverified rows.
-Scrape SQL is capped at5s. Existing history uses occurred-time as the lag fallback,
-so initial backfill deliberately raises lag alerts. Measure planner, membership
-index growth and lag-query cost on a realistic clone before activation; the bounded
-queries are not a production capacity proof. Keep current writes and enough free
-space throughout backfill. Archive metadata/membership consumes additional PG space.
+Queue installation and capture of a fixed historical UUID upper bound happen in
+one READ COMMITTED transaction with a3s lock budget; timeout fails startup without
+partial schema installation. The worker reconciles at most1000 primary-key events
+per tick, applying the limit before membership joins. Its durable UUID cursor is
+only for pre-trigger history: insert capture covers late commits on either side
+of it. Catalogued history is skipped and planned jobs retain their identity.
+Migration/backfill do not rewrite old receipts or remove hot events.
+
+Planning records fixed membership and a stable job UUID. One180s lease coordinates
+replicas; SQL is limited to15s and the whole job to150s. Jobs stay `planned` until
+both pinned objects are verified. Completion takes the planning lock, checks the
+lease fence, catalogues the receipt and dequeues exactly that job's events in one
+transaction. Failed/lost receipts keep pending rows and replay the same keys;
+conditional PUT reuses versions and conflicting bytes stop progress. Existing
+planned jobs are repaired from their bounded membership before retry. Successful
+bootstrap or export ticks wait1s; idle/failing ticks wait30s.
+
+`audit_archive_pending_events` is an exact count of discovered pending events,
+including planned-but-unverified rows, maintained transactionally across32 stable
+full-UUID hash buckets. Scraping reads32 counter rows and the indexed oldest queue
+entry, under5s. `audit_archive_bootstrap_complete` must be1 before count/oldest age
+represent all preexisting history. Until then they cover discovered events only;
+`audit_archive_scrape_success` reports SQL availability independently. Missing
+counter/state rows fail observation rather than report a healthy empty backlog.
+Counters and queue are part of the PG backup/restore boundary; never manually
+edit them or disable triggers. Arbitrary multi-statement writers must retry a
+whole transaction on deadlock/serialization failure; canonical ingest uses one
+ordered final INSERT and retains broker deliveries on transient PG errors.
+
+Upgrade every archive worker before activation; mixed old/new archive planners
+or completers are unsupported. Older ingest writers are supported by the trigger.
+For rollback disable archive workers on all replicas first; keep the queue and
+capture triggers so incoming history remains recoverable. Do not enable an old
+archive image against this queue. The migration owner must own the audit schema
+and can install triggers/functions. Trigger functions are SECURITY DEFINER with
+fixed pg_catalog/own-schema/pg_temp search path and public execution revoked;
+INSERT-only writers need no queue/counter grants. Keep schema CREATE privileges
+restricted to the owner and verify them before activation.
+
+Measure ingest contention, queue/index churn and space on a representative clone
+before activation. Pending rows/counters add PG writes and space; queue autovacuum
+must keep up with dequeue churn. The pending relation explicitly uses2% vacuum/
+analyze scale factors and1000-row thresholds, rather than inheriting the20%
+standard vacuum factor. These are scheduling thresholds, not a latency guarantee;
+monitor dead tuples/last autovacuum and test infra storage headroom. The synthetic
+1.9M-row churn test had no temporary spills but a1.037s first oldest-entry lookup
+before VACUUM, falling to0.081ms after cleanup. Its timing evidence preceded these
+explicit settings; it does not measure production autovacuum scheduling. Synthetic scale timings do not prove production
+TLS/grants, HA, concurrent workload headroom or all-node rollout.
 
 All hot rows remain. Membership foreign keys currently prevent deletion of planned
 or archived rows. This is not the final partition-retirement schema. A complete hourly
@@ -319,7 +358,7 @@ They cover failed manifests, job replay, stale workers, late commits and preserv
 receipt times. The fake S3 protocol tests in core cover both static and IAM modes,
 version mismatch and conditional-write retries. A separate two-event live Yandex
 preflight subsequently passed; it is not a production-history or capacity proof.
-Configs and Prometheus rule source remain disabled/unpublished.
+Archive/outbox activation remains disabled; compatible releases and initial monitoring source are published.
 
 ## Archive operator and recovery drill
 
@@ -375,3 +414,33 @@ The container image includes `/usr/local/bin/csar-audit-archive`. Use
 continues to start the audit server. Restore remains guarded to the explicit local
 fixture database. Mount only the protected reader configuration and receipt needed
 for the operation.
+
+### Explicit second-copy operator
+
+All primary batches share the existing `aurumskynet-audit-prod` bucket, separated
+by archive keys. No per-batch bucket provisioning is needed. The packaged CLI
+also prepares an optional second-copy workflow once its destination is selected:
+
+```bash
+csar-audit-archive replicate --source-config protected-reader.yaml \
+  --destination-config protected-copy-writer.yaml \
+  --receipt-file source-receipt.json --output-receipt new-copy-receipt.json
+```
+
+Both configurations use the archive-only schema. Source and destination must
+have matching environments and distinct normalized object namespaces. Different
+prefixes/buckets alone do not establish an independent provider or failure domain;
+review DNS aliases, provider ownership, versioning, encryption and read/delete
+permissions before use. No second bucket or cloud copy has been provisioned by
+this source change. The operator verifies the pinned source before destination
+writes, reuses conditional bounded Export, then verifies the pinned destination.
+It retains batch identity/time/coverage while rewriting destination version IDs.
+It is a logical verified copy, not a byte-for-byte provider-version transplant.
+
+A new output receipt is created exclusively with0600 permissions and synced;
+existing files are not overwritten. On failure, uploaded objects and any partial
+receipt file remain. Retry with a new receipt path and the same source receipt:
+conditional upload preserves prior destination versions. Reports/errors contain
+metadata and stage labels, never event payloads or credentials. This command has
+no database, broker, runtime bootstrap, deletion or activation behavior. Automatic
+replication scheduling and bulk manifest discovery/rebuild remain separate work.

@@ -19,9 +19,13 @@ type Worker struct {
 func (w *Worker) Tick(ctx context.Context) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, 150*time.Second)
 	defer cancel()
+	progress, err := w.Jobs.Backfill(ctx)
+	if err != nil {
+		return false, err
+	}
 	job, err := w.Jobs.Claim(ctx, w.Environment)
 	if err != nil || job == nil {
-		return false, err
+		return progress, err
 	}
 	records, err := w.Jobs.Load(ctx, job)
 	if err == nil {
@@ -63,32 +67,39 @@ func (w *Worker) Run(ctx context.Context, logger *slog.Logger) {
 }
 
 type archiveCollector struct {
-	jobs                *Jobs
-	count, age, success *prometheus.Desc
+	jobs                           *Jobs
+	count, age, success, bootstrap *prometheus.Desc
 }
 
 func (j *Jobs) RegisterMetrics(registry prometheus.Registerer) error {
 	return registry.Register(&archiveCollector{jobs: j,
-		count:   prometheus.NewDesc("audit_archive_pending_events", "Hot events not yet covered by a verified catalogued manifest", nil, nil),
-		age:     prometheus.NewDesc("audit_archive_oldest_age_seconds", "Oldest unarchived receipt age; historical events fall back to occurred time", nil, nil),
-		success: prometheus.NewDesc("audit_archive_scrape_success", "Whether archive lag query succeeded", nil, nil)})
+		count:     prometheus.NewDesc("audit_archive_pending_events", "Discovered hot events not covered by a verified manifest; complete history only after bootstrap", nil, nil),
+		age:       prometheus.NewDesc("audit_archive_oldest_age_seconds", "Oldest unarchived receipt age; historical events fall back to occurred time", nil, nil),
+		success:   prometheus.NewDesc("audit_archive_scrape_success", "Whether bounded archive metrics query succeeded", nil, nil),
+		bootstrap: prometheus.NewDesc("audit_archive_bootstrap_complete", "Whether all pre-trigger hot history has been reconciled", nil, nil)})
 }
 func (c *archiveCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.count
 	ch <- c.age
 	ch <- c.success
+	ch <- c.bootstrap
 }
 func (c *archiveCollector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var count int64
 	var age float64
-	err := c.jobs.Pool.QueryRow(ctx, `SELECT count(*),COALESCE(GREATEST(extract(epoch FROM clock_timestamp()-min(COALESCE(e.received_at,e.created_at))),0),0)::float8
- FROM audit_events e WHERE NOT EXISTS(SELECT 1 FROM audit_archive_members m JOIN audit_archive_jobs j ON j.id=m.job_id WHERE m.event_id=e.id AND j.state='catalogued')`).Scan(&count, &age)
+	var complete bool
+	err := c.jobs.Pool.QueryRow(ctx, pendingMetricsQuery).Scan(&count, &age, &complete)
 	if err != nil {
 		ch <- prometheus.MustNewConstMetric(c.success, prometheus.GaugeValue, 0)
 		return
 	}
+	var bootstrap float64
+	if complete {
+		bootstrap = 1
+	}
+	ch <- prometheus.MustNewConstMetric(c.bootstrap, prometheus.GaugeValue, bootstrap)
 	ch <- prometheus.MustNewConstMetric(c.success, prometheus.GaugeValue, 1)
 	ch <- prometheus.MustNewConstMetric(c.count, prometheus.GaugeValue, float64(count))
 	ch <- prometheus.MustNewConstMetric(c.age, prometheus.GaugeValue, age)

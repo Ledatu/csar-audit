@@ -29,6 +29,12 @@ func (j *Jobs) Migrate(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, archiveDBTimeout)
 	defer cancel()
 	return pgutil.WithTx(ctx, j.Pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout='3s'`); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(839106410824)`); err != nil {
 			return err
 		}
@@ -47,7 +53,10 @@ CREATE TABLE IF NOT EXISTS audit_archive_members(
  job_id uuid NOT NULL REFERENCES audit_archive_jobs(id) ON DELETE RESTRICT
 );
 CREATE INDEX IF NOT EXISTS audit_archive_members_job ON audit_archive_members(job_id);`)
-		return err
+		if err != nil {
+			return err
+		}
+		return migrateQueue(ctx, tx)
 	})
 }
 
@@ -84,15 +93,7 @@ func (j *Jobs) Claim(ctx context.Context, environment string) (*Job, error) {
 				return errors.New("pending archive job belongs to another environment")
 			}
 		case errors.Is(err, pgx.ErrNoRows):
-			rows, err := tx.Query(ctx, `WITH candidates AS MATERIALIZED (
- SELECT e.id,e.created_at,6::bigint*octet_length(to_jsonb(e)::text)+1024 AS budget
- FROM audit_events AS e WHERE NOT EXISTS(SELECT 1 FROM audit_archive_members AS m WHERE m.event_id=e.id)
- AND (e.received_at IS NULL OR e.received_at<=clock_timestamp()-interval '1 hour')
- ORDER BY e.created_at,e.id LIMIT 200
-), bounded AS (
- SELECT id,sum(budget) OVER(ORDER BY created_at,id) AS cumulative FROM candidates
-) SELECT `+recordProjection+` FROM bounded JOIN audit_events AS e ON e.id=bounded.id
- WHERE cumulative<=$1 ORDER BY e.created_at,e.id`, MaxChunkBytes)
+			rows, err := tx.Query(ctx, candidateQuery, MaxChunkBytes)
 			if err != nil {
 				return err
 			}
@@ -102,7 +103,7 @@ func (j *Jobs) Claim(ctx context.Context, environment string) (*Job, error) {
 			}
 			if len(records) == 0 {
 				var eligible bool
-				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM audit_events e WHERE NOT EXISTS(SELECT 1 FROM audit_archive_members m WHERE m.event_id=e.id) AND (e.received_at IS NULL OR e.received_at<=clock_timestamp()-interval '1 hour'))`).Scan(&eligible); err != nil {
+				if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM audit_archive_pending WHERE job_id IS NULL AND eligible_at<=statement_timestamp())`).Scan(&eligible); err != nil {
 					return err
 				}
 				if eligible {
@@ -147,6 +148,14 @@ func (j *Jobs) Claim(ctx context.Context, environment string) (*Job, error) {
 		default:
 			return err
 		}
+		// Pre-queue planned jobs may be retried before bootstrap reaches their IDs.
+		if _, err := tx.Exec(ctx, `INSERT INTO audit_archive_pending(event_id,eligible_at,oldest_at,job_id)
+ SELECT e.id,COALESCE(e.received_at+interval '1 hour','-infinity'::timestamptz),COALESCE(e.received_at,e.created_at),m.job_id
+ FROM audit_archive_members m JOIN audit_events e ON e.id=m.event_id WHERE m.job_id=$1
+ ORDER BY e.id ON CONFLICT(event_id) DO UPDATE SET job_id=EXCLUDED.job_id`, candidate.ID); err != nil {
+			return err
+		}
+
 		if _, err := tx.Exec(ctx, `UPDATE audit_archive_jobs SET lease_token=$2,lease_until=clock_timestamp()+interval '180 seconds' WHERE id=$1`, candidate.ID, candidate.Token); err != nil {
 			return err
 		}
@@ -217,15 +226,31 @@ func (j *Jobs) Complete(ctx context.Context, job *Job, receipt *ExportReceipt) e
 	}
 	ctx, cancel := context.WithTimeout(ctx, archiveDBTimeout)
 	defer cancel()
-	tag, err := j.Pool.Exec(ctx, `UPDATE audit_archive_jobs SET state='catalogued',receipt=$3,verified_at=clock_timestamp(),lease_token=NULL,lease_until=NULL
+	return pgutil.WithTx(ctx, j.Pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`); err != nil {
+			return err
+		}
+		// Same order as bootstrap/Claim prevents stale bootstrap resurrection.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(839106410825)`); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `UPDATE audit_archive_jobs SET state='catalogued',receipt=$3,verified_at=clock_timestamp(),lease_token=NULL,lease_until=NULL
  WHERE id=$1 AND lease_token=$2 AND lease_until>clock_timestamp() AND state='planned'`, job.ID, job.Token, body)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() != 1 {
-		return ErrArchiveLeaseLost
-	}
-	return nil
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrArchiveLeaseLost
+		}
+		tag, err = tx.Exec(ctx, `DELETE FROM audit_archive_pending WHERE job_id=$1`, job.ID)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != int64(job.Rows) {
+			return errors.New("archive pending membership mismatch")
+		}
+		return nil
+	})
 }
 
 func (j *Jobs) Retry(ctx context.Context, job *Job) error {

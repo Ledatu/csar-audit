@@ -71,8 +71,12 @@ Central audit service for the CSAR stack. It ingests audit events, buffers them 
 - Migration 004 adds nullable canonical `received_at`; historical timestamps
   remain unknown, future inserts default to DB receipt time, exact replay never
   changes the first receipt. The physical event table is not partitioned here.
-- Persistent job/member rows select committed unarchived events, with one-hour
-  receipt lag and no timestamp cursor. Claims override session isolation to
+- A durable pending queue captures committed inserts via a statement trigger,
+  including older/COPY writers and late UUIDs; at most200 indexed eligible IDs
+  are materialized before payload joins. Known receipts retain one-hour lag.
+  A READ COMMITTED locked migration installs capture before a fixed upperUUID;
+  restart-safe bootstrap examines at most1000 PK rows before membership joins.
+  No steady-state timestamp cursor or full-history anti-join is used. Claims override session isolation to
   READ COMMITTED and are fenced by token/180s lease; work is capped at 150s.
   Batches have at most 200 rows and 32MiB uncompressed content, with conservative
   SQL byte budgeting before fetching event payloads.
@@ -85,7 +89,13 @@ Central audit service for the CSAR stack. It ingests audit events, buffers them 
   occurred/receipt timestamps, counts and checksums. Automatic catalog discovery/
   rebuild and authorized cold queries remain unimplemented.
 - Lag collectors include unverified jobs and fail visibly on query errors.
-  Full backlog scans and membership/catalog growth need clone capacity tests.
+  Lag reads32 transactionally maintained full-UUID hash counters plus indexed
+  oldest pending entry. Bootstrap-complete distinguishes partial discovery
+  from complete historical coverage. Completion fences/catalogues/dequeues in
+  one planning-locked transaction. INSERT-only writers use fixed-search-path
+  SECURITY DEFINER capture; schema ownership/CREATE restrictions are required.
+  All archive workers must upgrade before activation; mixed completers cannot
+  maintain the queue. Clone ingest contention/queue churn/capacity remain gates.
   FK membership protects hot rows; it is not sealed-partition retirement proof.
 - Local PG 18.6 and fake SDK/IAM object endpoints test crash/lost receipt, lease
   failover, late commits and corruption. Independent copy and production capacity
@@ -111,3 +121,16 @@ Central audit service for the CSAR stack. It ingests audit events, buffers them 
 - See `ops/archive/reader.example.yaml`, `bucket-policy.template.json`, README and
   `plans/2026-10-08-audit-s3-preflight.json`. The Docker image packages the CLI alongside the server.
   Compatible core/proto/image releases precede runtime activation.
+
+## Bounded queue and optional replica operator (source follow-up)
+- Pending queue uses2% vacuum/analyze factors and1000-row thresholds; clone/infra
+  maintenance scheduling remains a gate. Heavy synthetic churn proved index
+  cleanup matters even when candidate/metric queries produce zero temp spills.
+- `csar-audit-archive replicate` verifies source before writing and destination
+  afterward, rewriting destination version receipts while preserving logical
+  records/batch/time. It uses archive-only configs and exclusive0600 synced
+  receipt files. Same namespace/config/descriptor mismatches are rejected; partial
+  uploads are retained for conditional retry using a new local receipt path.
+- One existing primary bucket serves all batches. A distinct object namespace
+  does not prove an independent failure domain; destination choice and actual
+  replication/restore drills remain pending. No new cloud resource or activation.
