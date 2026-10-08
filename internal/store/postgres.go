@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ledatu/csar-core/audit"
@@ -85,10 +86,15 @@ CREATE INDEX IF NOT EXISTS idx_audit_created_at
     ON audit_events (created_at DESC, id DESC);
 `,
 	},
+	{Name: "004_canonical_receipt", Up: `
+-- Existing history has no reliable receipt time. Only future inserts get a default.
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS received_at timestamptz;
+ALTER TABLE audit_events ALTER COLUMN received_at SET DEFAULT clock_timestamp();
+`},
 }
 
 var copyFromColumns = []string{
-	"service", "actor", "action", "target_type", "target_id",
+	"id", "service", "actor", "action", "target_type", "target_id",
 	"scope_type", "scope_id", "before_state", "after_state", "metadata",
 	"request_id", "client_ip", "created_at",
 }
@@ -184,21 +190,134 @@ type GroupResult struct {
 	Groups []Group `json:"groups"`
 }
 
-// BatchInsert writes all events in a single database round-trip.
+// EventConflictError means an ID was reused with different event contents.
+// The entire batch is rolled back; existing events are never overwritten.
+type EventConflictError struct {
+	ID string
+}
+
+func (e *EventConflictError) Error() string {
+	return fmt.Sprintf("audit event ID %s has conflicting contents", e.ID)
+}
+
+// BatchInsert atomically persists a batch and verifies duplicate IDs against
+// existing contents. Exact replays succeed without inserting additional rows.
 func (s *Postgres) BatchInsert(ctx context.Context, events []audit.Event) error {
+	return s.batchInsert(ctx, events, nil, false)
+}
+
+// RestoreBatch preserves archived receipt times, including unknown historical
+// NULL values. Only the guarded isolated restore command calls this path.
+// Existing events must match both content and canonical receipt; no overwrite.
+func (s *Postgres) RestoreBatch(ctx context.Context, events []audit.Event, receipts []*time.Time) error {
+	if len(events) != len(receipts) {
+		return fmt.Errorf("restore receipt count mismatch")
+	}
+	seen := make(map[string]struct{}, len(events))
+	for i := range events {
+		id, err := uuid.Parse(events[i].ID)
+		if err != nil || id == uuid.Nil || id.String() != events[i].ID || events[i].CreatedAt.IsZero() {
+			return fmt.Errorf("restore requires existing event identity and timestamp")
+		}
+		key := events[i].ID
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("restore duplicate event ID")
+		}
+		seen[key] = struct{}{}
+		if !events[i].CreatedAt.Equal(events[i].CreatedAt.Truncate(time.Microsecond)) || (receipts[i] != nil && (receipts[i].IsZero() || !receipts[i].Equal(receipts[i].Truncate(time.Microsecond)))) {
+			return fmt.Errorf("restore timestamps must preserve PostgreSQL microsecond precision")
+		}
+	}
+	return s.batchInsert(ctx, events, receipts, true)
+}
+
+func (s *Postgres) batchInsert(ctx context.Context, events []audit.Event, receipts []*time.Time, restoring bool) error {
 	if len(events) == 0 {
 		return nil
 	}
-	if len(events) > copyFromThreshold {
-		return s.batchInsertCopyFrom(ctx, events)
+	prepared := make([]audit.Event, len(events))
+	for i := range events {
+		event, err := audit.PrepareEvent(&events[i])
+		if err != nil {
+			return fmt.Errorf("prepare audit batch event: %w", err)
+		}
+		prepared[i] = *event
 	}
-	return s.batchInsertMultiRow(ctx, events)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return fmt.Errorf("begin audit batch: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	// No indexes/defaults: this table only holds the incoming values for the
+	// current transaction, including repeated IDs within one delivery batch.
+	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE audit_event_batch
+		(LIKE audit_events) ON COMMIT DROP`); err != nil {
+		return fmt.Errorf("create audit batch staging: %w", err)
+	}
+	if len(events) > copyFromThreshold {
+		err = s.batchInsertCopyFrom(ctx, tx, prepared)
+	} else {
+		err = s.batchInsertMultiRow(ctx, tx, prepared)
+	}
+	if err != nil {
+		return err
+	}
+	columns := strings.Join(copyFromColumns, ", ")
+	if restoring {
+		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE audit_restore_receipts(id uuid,received_at timestamptz) ON COMMIT DROP`); err != nil {
+			return fmt.Errorf("create restore receipt staging: %w", err)
+		}
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"pg_temp", "audit_restore_receipts"}, []string{"id", "received_at"}, pgx.CopyFromSlice(len(prepared), func(i int) ([]any, error) {
+			return []any{prepared[i].ID, receipts[i]}, nil
+		})); err != nil {
+			return fmt.Errorf("stage restore receipts: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE pg_temp.audit_event_batch e SET received_at=r.received_at FROM pg_temp.audit_restore_receipts r WHERE e.id=r.id`); err != nil {
+			return fmt.Errorf("restore receipt timestamps: %w", err)
+		}
+		columns += ", received_at"
+	}
+	// Stable lock order prevents concurrent overlapping batches from acquiring
+	// unique-index locks in opposite order.
+	if _, err := tx.Exec(ctx, `INSERT INTO audit_events (`+columns+`)
+		SELECT `+columns+` FROM pg_temp.audit_event_batch ORDER BY id
+		ON CONFLICT (id) DO NOTHING`); err != nil {
+		return fmt.Errorf("insert audit batch: %w", err)
+	}
+	// A separate READ COMMITTED statement also sees a concurrently committed
+	// row that caused ON CONFLICT to wait. JSONB comparison ignores key order.
+	var conflictingID string
+	receiptConflict := ""
+	if restoring {
+		receiptConflict = " OR incoming.received_at IS DISTINCT FROM stored.received_at"
+	}
+	err = tx.QueryRow(ctx, `SELECT incoming.id::text
+		FROM pg_temp.audit_event_batch incoming JOIN audit_events stored USING (id)
+		WHERE ROW(incoming.service, incoming.actor, incoming.action,
+		 incoming.target_type, incoming.target_id, incoming.scope_type, incoming.scope_id,
+		 incoming.before_state, incoming.after_state, incoming.metadata,
+		 incoming.request_id, incoming.client_ip, incoming.created_at)
+		IS DISTINCT FROM ROW(stored.service, stored.actor, stored.action,
+		 stored.target_type, stored.target_id, stored.scope_type, stored.scope_id,
+		 stored.before_state, stored.after_state, stored.metadata,
+		 stored.request_id, stored.client_ip, stored.created_at)`+receiptConflict+`
+		LIMIT 1`).Scan(&conflictingID)
+	if err == nil {
+		return &EventConflictError{ID: conflictingID}
+	}
+	if err != pgx.ErrNoRows {
+		return fmt.Errorf("verify audit batch replays: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit audit batch: %w", err)
+	}
+	return nil
 }
 
-func (s *Postgres) batchInsertMultiRow(ctx context.Context, events []audit.Event) error {
-	const colsPerRow = 13
+func (s *Postgres) batchInsertMultiRow(ctx context.Context, tx pgx.Tx, events []audit.Event) error {
+	const colsPerRow = 14
 	var sb strings.Builder
-	sb.WriteString(`INSERT INTO audit_events (service, actor, action, target_type, target_id, scope_type, scope_id, before_state, after_state, metadata, request_id, client_ip, created_at) VALUES `)
+	sb.WriteString(`INSERT INTO pg_temp.audit_event_batch (` + strings.Join(copyFromColumns, ", ") + `) VALUES `)
 	args := make([]any, 0, len(events)*colsPerRow)
 	idx := 1
 	for i := range events {
@@ -215,41 +334,33 @@ func (s *Postgres) batchInsertMultiRow(ctx context.Context, events []audit.Event
 		}
 		sb.WriteByte(')')
 		e := &events[i]
-		created := e.CreatedAt
-		if created.IsZero() {
-			created = time.Now().UTC()
-		}
 		args = append(args,
-			e.Service, e.Actor, e.Action, e.TargetType, e.TargetID,
+			e.ID, e.Service, e.Actor, e.Action, e.TargetType, e.TargetID,
 			e.ScopeType, e.ScopeID,
 			nullableJSON(e.BeforeState), nullableJSON(e.AfterState), nullableJSON(e.Metadata),
 			e.RequestID, e.ClientIP,
-			created,
+			e.CreatedAt,
 		)
 	}
-	_, err := s.pool.Exec(ctx, sb.String(), args...)
+	_, err := tx.Exec(ctx, sb.String(), args...)
 	if err != nil {
 		return fmt.Errorf("batch insert audit events: %w", err)
 	}
 	return nil
 }
 
-func (s *Postgres) batchInsertCopyFrom(ctx context.Context, events []audit.Event) error {
-	_, err := s.pool.CopyFrom(ctx,
-		pgx.Identifier{"audit_events"},
+func (s *Postgres) batchInsertCopyFrom(ctx context.Context, tx pgx.Tx, events []audit.Event) error {
+	_, err := tx.CopyFrom(ctx,
+		pgx.Identifier{"pg_temp", "audit_event_batch"},
 		copyFromColumns,
 		pgx.CopyFromSlice(len(events), func(i int) ([]any, error) {
 			e := &events[i]
-			created := e.CreatedAt
-			if created.IsZero() {
-				created = time.Now().UTC()
-			}
 			return []any{
-				e.Service, e.Actor, e.Action, e.TargetType, e.TargetID,
+				e.ID, e.Service, e.Actor, e.Action, e.TargetType, e.TargetID,
 				e.ScopeType, e.ScopeID,
 				nullableJSON(e.BeforeState), nullableJSON(e.AfterState), nullableJSON(e.Metadata),
 				e.RequestID, e.ClientIP,
-				created,
+				e.CreatedAt,
 			}, nil
 		}),
 	)

@@ -67,6 +67,29 @@ func (cm *ConnectionManager) Channel() (*amqp091.Channel, error) {
 	return cm.conn.Channel()
 }
 
+// publisherChannel interrupts channel RPCs/socket writes on request expiry.
+// amqp091.PublishWithContext itself does not honor cancellation. Aborting this
+// captured connection may make other in-flight receipts uncertain; their event
+// IDs support replay and the manager reconnects. Never abort a newer connection.
+func (cm *ConnectionManager) publisherChannel(ctx context.Context) (*amqp091.Channel, func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	cm.mu.RLock()
+	conn := cm.conn
+	cm.mu.RUnlock()
+	if conn == nil || conn.IsClosed() {
+		return nil, nil, fmt.Errorf("amqp: connection not available")
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.CloseDeadline(time.Now()) })
+	ch, err := conn.Channel()
+	if err != nil {
+		stop()
+		return nil, nil, err
+	}
+	return ch, func() { stop() }, nil
+}
+
 // Close stops the reconnect loop and closes the underlying connection.
 func (cm *ConnectionManager) Close() error {
 	close(cm.closeCh)

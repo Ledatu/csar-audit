@@ -2,6 +2,8 @@ package ingest
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/ledatu/csar-audit/internal/pipeline"
 	"github.com/ledatu/csar-core/audit"
@@ -15,16 +17,17 @@ const maxEventsPerBatch = 1000
 // GRPC implements AuditIngestServiceServer.
 type GRPC struct {
 	auditv1.UnimplementedAuditIngestServiceServer
-	buf *pipeline.Buffer
+	buf     submitter
+	timeout time.Duration
 }
 
 // NewGRPC builds a gRPC ingest handler.
-func NewGRPC(buf *pipeline.Buffer) *GRPC {
-	return &GRPC{buf: buf}
+func NewGRPC(buf submitter, timeout time.Duration) *GRPC {
+	return &GRPC{buf: buf, timeout: timeout}
 }
 
 // RecordEvent implements AuditIngestService.
-func (s *GRPC) RecordEvent(_ context.Context, req *auditv1.RecordEventRequest) (*auditv1.RecordEventResponse, error) {
+func (s *GRPC) RecordEvent(ctx context.Context, req *auditv1.RecordEventRequest) (*auditv1.RecordEventResponse, error) {
 	if req == nil || req.Event == nil {
 		return nil, status.Error(codes.InvalidArgument, "event is required")
 	}
@@ -32,14 +35,16 @@ func (s *GRPC) RecordEvent(_ context.Context, req *auditv1.RecordEventRequest) (
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	if err := s.buf.Submit(&e); err != nil {
-		return nil, status.Error(codes.ResourceExhausted, "ingest buffer full")
+	ctx, cancel := s.receiptContext(ctx)
+	defer cancel()
+	if err := s.buf.Submit(ctx, &e); err != nil {
+		return nil, receiptError(err)
 	}
 	return &auditv1.RecordEventResponse{}, nil
 }
 
 // RecordEvents implements AuditIngestService.
-func (s *GRPC) RecordEvents(_ context.Context, req *auditv1.RecordEventsRequest) (*auditv1.RecordEventsResponse, error) {
+func (s *GRPC) RecordEvents(ctx context.Context, req *auditv1.RecordEventsRequest) (*auditv1.RecordEventsResponse, error) {
 	if req == nil || len(req.Events) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "events required")
 	}
@@ -56,13 +61,36 @@ func (s *GRPC) RecordEvents(_ context.Context, req *auditv1.RecordEventsRequest)
 		events = append(events, e)
 	}
 
+	ctx, cancel := s.receiptContext(ctx)
+	defer cancel()
 	var accepted int32
 	for i := range events {
-		if err := s.buf.Submit(&events[i]); err != nil {
+		if err := s.buf.Submit(ctx, &events[i]); err != nil {
 			return &auditv1.RecordEventsResponse{Accepted: accepted},
-				status.Errorf(codes.ResourceExhausted, "ingest buffer full after %d of %d events", accepted, len(events))
+				receiptError(err)
 		}
 		accepted++
 	}
 	return &auditv1.RecordEventsResponse{Accepted: accepted}, nil
+}
+
+func (s *GRPC) receiptContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := s.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func receiptError(err error) error {
+	code := codes.Unavailable
+	switch {
+	case errors.Is(err, context.Canceled):
+		code = codes.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		code = codes.DeadlineExceeded
+	case errors.Is(err, pipeline.ErrFull):
+		code = codes.ResourceExhausted
+	}
+	return status.Error(code, "audit publication not confirmed; retry with retained event IDs")
 }

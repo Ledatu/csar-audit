@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ledatu/csar-audit/internal/archive"
 	"github.com/ledatu/csar-audit/internal/config"
 	"github.com/ledatu/csar-audit/internal/consumer"
 	"github.com/ledatu/csar-audit/internal/ingest"
@@ -29,6 +30,7 @@ import (
 	"github.com/ledatu/csar-core/logutil"
 	"github.com/ledatu/csar-core/observe"
 	"github.com/ledatu/csar-core/pgutil"
+	"github.com/ledatu/csar-core/s3store"
 	"github.com/ledatu/csar-core/tlsx"
 	auditv1 "github.com/ledatu/csar-proto/csar/audit/v1"
 	"google.golang.org/grpc"
@@ -128,12 +130,31 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 	buf := pipeline.NewBuffer(cfg.Ingest.BufferSize, cfg.Ingest.PublisherWorkers, pub, logger, &pipeline.BufferMetrics{
 		EventsPublished: m.EventsPublished,
 		EventsDropped:   m.EventsDropped,
-	})
+	}, cfg.Ingest.ReceiptTimeout.Std())
 	defer buf.Close()
 	bufDepth = func() float64 { return float64(buf.Depth()) }
 
 	appCtx, appCancel := context.WithCancel(context.Background())
 	defer appCancel()
+	if cfg.Archive.Enabled {
+		jobs := &archive.Jobs{Pool: pool}
+		if err := jobs.Migrate(ctx); err != nil {
+			return fmt.Errorf("archive metadata migration: %w", err)
+		}
+		objects, err := s3store.NewClient(&s3store.Config{Bucket: cfg.Archive.Bucket, Endpoint: cfg.Archive.Endpoint, Region: cfg.Archive.Region, Prefix: cfg.Archive.Prefix, Auth: cfg.Archive.Auth}, logger.With("component", "archive-s3"))
+		if err != nil {
+			return err
+		}
+		if err := jobs.RegisterMetrics(reg); err != nil {
+			_ = objects.Close()
+			return err
+		}
+		worker := &archive.Worker{Jobs: jobs, Objects: archive.S3Objects{Client: objects}, Environment: cfg.Archive.Environment}
+		archiveCtx, stopArchive := context.WithCancel(appCtx)
+		archiveDone := make(chan struct{})
+		go func() { defer close(archiveDone); worker.Run(archiveCtx, logger.With("component", "archive")) }()
+		defer func() { stopArchive(); <-archiveDone; _ = objects.Close() }()
+	}
 	go consumer.Run(appCtx, cm, pgStore, cfg, logger, &consumer.ConsumerMetrics{
 		BatchSize:         m.BatchSize,
 		BatchFlushSeconds: m.BatchFlushSeconds,
@@ -142,7 +163,7 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 	})
 
 	mux := http.NewServeMux()
-	mux.Handle("POST /ingest", ingest.NewHTTPHandler(buf, logger))
+	mux.Handle("POST /ingest", ingest.NewHTTPHandler(buf, logger, cfg.Ingest.ReceiptTimeout.Std()))
 	query.New(pgStore).Register(mux)
 
 	trust := buildTrustFunc(cfg)
@@ -182,7 +203,7 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 	}
 
 	grpcServer := grpc.NewServer(grpcOpts...)
-	auditv1.RegisterAuditIngestServiceServer(grpcServer, ingest.NewGRPC(buf))
+	auditv1.RegisterAuditIngestServiceServer(grpcServer, ingest.NewGRPC(buf, cfg.Ingest.ReceiptTimeout.Std()))
 	if cfg.GRPC.Reflection {
 		reflection.Register(grpcServer)
 	}

@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/ledatu/csar-core/configutil"
+	"github.com/ledatu/csar-core/storage"
 	"github.com/ledatu/csar-core/tlsx"
+	"github.com/ledatu/csar-core/ycloud"
 	"gopkg.in/yaml.v3"
 )
 
@@ -22,6 +24,19 @@ type Config struct {
 	Consumer ConsumerConfig  `yaml:"consumer"`
 	HTTP     HTTPExtraConfig `yaml:"http"`
 	Tracing  TracingConfig   `yaml:"tracing"`
+	Archive  ArchiveConfig   `yaml:"archive"`
+}
+
+// ArchiveConfig is startup-only and disabled by default. Destination credentials
+// use existing secret expansion; enabling never permits deletion or expiry.
+type ArchiveConfig struct {
+	Enabled     bool              `yaml:"enabled"`
+	Environment string            `yaml:"environment"`
+	Bucket      string            `yaml:"bucket"`
+	Endpoint    string            `yaml:"endpoint"`
+	Region      string            `yaml:"region"`
+	Prefix      string            `yaml:"prefix"`
+	Auth        ycloud.AuthConfig `yaml:"auth"`
 }
 
 // ServiceConfig describes HTTP and health listen ports.
@@ -59,17 +74,19 @@ type RabbitMQConfig struct {
 
 // IngestConfig configures the in-memory buffer and publisher workers.
 type IngestConfig struct {
-	BufferSize       int `yaml:"buffer_size"`
-	PublisherWorkers int `yaml:"publisher_workers"`
+	ReceiptTimeout   configutil.Duration `yaml:"receipt_timeout"`
+	BufferSize       int                 `yaml:"buffer_size"`
+	PublisherWorkers int                 `yaml:"publisher_workers"`
 }
 
 // ConsumerConfig configures the batch consumer reading from RabbitMQ.
 type ConsumerConfig struct {
-	Queue           ConsumerQueueConfig `yaml:"queue"`
-	DLQ             ConsumerDLQConfig   `yaml:"dlq"`
-	BatchSize       int                 `yaml:"batch_size"`
-	FlushInterval   configutil.Duration `yaml:"flush_interval"`
-	MaxRedeliveries int                 `yaml:"max_redeliveries"`
+	Queue         ConsumerQueueConfig `yaml:"queue"`
+	DLQ           ConsumerDLQConfig   `yaml:"dlq"`
+	BatchSize     int                 `yaml:"batch_size"`
+	FlushInterval configutil.Duration `yaml:"flush_interval"`
+	// MaxRedeliveries is deprecated: DB outages never classify events as poison.
+	MaxRedeliveries int `yaml:"max_redeliveries"`
 }
 
 // ConsumerQueueConfig is the primary audit queue.
@@ -125,6 +142,9 @@ func defaults(cfg *Config) {
 	if cfg.GRPC.Port == 0 {
 		cfg.GRPC.Port = 9084
 	}
+	if cfg.Ingest.ReceiptTimeout.Std() == 0 {
+		cfg.Ingest.ReceiptTimeout.Duration = 30 * time.Second
+	}
 	if cfg.Ingest.BufferSize == 0 {
 		cfg.Ingest.BufferSize = 10_000
 	}
@@ -164,11 +184,22 @@ func defaults(cfg *Config) {
 }
 
 func (c *Config) validate() error {
+	if c.Archive.Enabled {
+		if err := c.Archive.Validate(); err != nil {
+			return err
+		}
+	}
 	if c.Database.DSN == "" {
 		return fmt.Errorf("database.dsn is required")
 	}
 	if c.RabbitMQ.URL == "" {
 		return fmt.Errorf("rabbitmq.url is required")
+	}
+	if c.Ingest.ReceiptTimeout.Std() <= 0 {
+		return fmt.Errorf("ingest.receipt_timeout must be positive")
+	}
+	if c.Consumer.Queue.Name == c.Consumer.DLQ.Name {
+		return fmt.Errorf("consumer queue and DLQ must be distinct")
 	}
 	if c.Ingest.BufferSize < 1 {
 		return fmt.Errorf("ingest.buffer_size must be >= 1")
@@ -186,6 +217,18 @@ func (c *Config) validate() error {
 		return fmt.Errorf("consumer.dlq.type must be quorum")
 	}
 	return nil
+}
+
+// Validate is also used by offline archive tools, independently of runtime enablement.
+func (c *ArchiveConfig) Validate() error {
+	if c.Bucket == "" || c.Endpoint == "" || c.Region == "" {
+		return fmt.Errorf("archive requires explicit bucket, endpoint and region")
+	}
+	if err := storage.ValidateScopeName(c.Environment); err != nil {
+		return err
+	}
+	_, err := storage.JoinObjectKey(c.Prefix, "audit/v1/check")
+	return err
 }
 
 // HTTPAddr returns the HTTP listen address (e.g. ":8083").

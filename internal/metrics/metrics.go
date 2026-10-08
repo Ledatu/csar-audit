@@ -50,7 +50,7 @@ func New(reg *prometheus.Registry, depthFn DepthFunc) *Metrics {
 		EventsDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "audit",
 			Name:      "events_dropped_total",
-			Help:      "Events dropped before reaching RabbitMQ.",
+			Help:      "Failed ingest receipts by reason; publication may be uncertain.",
 		}, []string{"reason"}),
 
 		BatchSize: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -70,7 +70,7 @@ func New(reg *prometheus.Registry, depthFn DepthFunc) *Metrics {
 		EventsWritten: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "audit",
 			Name:      "events_written_total",
-			Help:      "Events successfully persisted to PostgreSQL.",
+			Help:      "Persisted deliveries acknowledged after PG commit, including idempotent replays.",
 		}),
 
 		ConsumerErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
