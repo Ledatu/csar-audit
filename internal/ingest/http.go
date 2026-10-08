@@ -1,8 +1,10 @@
 package ingest
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/ledatu/csar-audit/internal/pipeline"
 	"github.com/ledatu/csar-core/audit"
@@ -11,7 +13,7 @@ import (
 )
 
 type submitter interface {
-	Submit(*audit.Event) error
+	Submit(context.Context, *audit.Event) error
 }
 
 type httpIngestBody struct {
@@ -20,27 +22,28 @@ type httpIngestBody struct {
 
 // HTTPHandler serves POST /ingest with a JSON batch body.
 type HTTPHandler struct {
-	buf    submitter
-	logger *slog.Logger
+	buf     submitter
+	logger  *slog.Logger
+	timeout time.Duration
 }
 
 // NewHTTPHandler constructs the HTTP ingest handler.
-func NewHTTPHandler(buf *pipeline.Buffer, logger *slog.Logger) *HTTPHandler {
+func NewHTTPHandler(buf *pipeline.Buffer, logger *slog.Logger, timeout time.Duration) *HTTPHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &HTTPHandler{buf: buf, logger: logger.With("component", "audit_ingest_http")}
+	return &HTTPHandler{buf: buf, logger: logger.With("component", "audit_ingest_http"), timeout: timeout}
 }
 
-// ServeHTTP validates the JSON batch, enqueues the events, and returns 202 Accepted.
+// ServeHTTP returns 202 only after every event has a confirmed broker receipt.
 func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var body httpIngestBody
 	if err := httpx.ReadJSON(r, &body); err != nil {
 		httpx.WriteError(w, err)
 		return
 	}
-	if len(body.Events) == 0 {
-		httpx.WriteError(w, csarerrors.Validation("events required"))
+	if len(body.Events) == 0 || len(body.Events) > maxEventsPerBatch {
+		httpx.WriteError(w, csarerrors.Validation("1 to %d events required", maxEventsPerBatch))
 		return
 	}
 
@@ -51,10 +54,16 @@ func (h *HTTPHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	timeout := h.timeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+	defer cancel()
 	for idx, event := range body.Events {
-		if err := h.buf.Submit(event); err != nil {
-			h.logger.Warn("audit ingest buffer full", "action", event.Action, "accepted", idx, "total", len(body.Events))
-			httpx.WriteError(w, csarerrors.Unavailable("audit ingest buffer full after %d of %d events", idx, len(body.Events)))
+		if err := h.buf.Submit(ctx, event); err != nil {
+			h.logger.Warn("audit ingest not confirmed", "action", event.Action, "accepted", idx, "total", len(body.Events))
+			httpx.WriteError(w, csarerrors.Unavailable("audit ingest not confirmed after %d of %d events; retry with retained event IDs", idx, len(body.Events)))
 			return
 		}
 	}

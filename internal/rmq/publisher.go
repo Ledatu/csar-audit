@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/ledatu/csar-core/amqpconfirm"
 	amqp091 "github.com/rabbitmq/amqp091-go"
 	"go.opentelemetry.io/otel"
 )
@@ -21,10 +22,17 @@ func NewPublisher(cm *ConnectionManager, queue string) *Publisher {
 
 // PublishRaw sends raw bytes with trace context in headers and waits for broker ack.
 func (p *Publisher) PublishRaw(ctx context.Context, body []byte) error {
-	ch, err := p.cm.Channel()
+	return p.Publish(ctx, &amqp091.Publishing{Body: body, ContentType: "application/json"})
+}
+
+// Publish requires mandatory routing and positive confirmation for one message.
+func (p *Publisher) Publish(ctx context.Context, input *amqp091.Publishing) error {
+	message := *input
+	ch, stop, err := p.cm.publisherChannel(ctx)
 	if err != nil {
 		return fmt.Errorf("open channel: %w", err)
 	}
+	defer stop()
 	defer func() { _ = ch.Close() }()
 
 	if err := ch.Confirm(false); err != nil {
@@ -32,34 +40,26 @@ func (p *Publisher) PublishRaw(ctx context.Context, body []byte) error {
 	}
 
 	confirmCh := ch.NotifyPublish(make(chan amqp091.Confirmation, 1))
+	returnCh := ch.NotifyReturn(make(chan amqp091.Return, 1))
 
 	headers := amqp091.Table{}
-	otel.GetTextMapPropagator().Inject(ctx, amqpCarrier(headers))
+	for k, v := range message.Headers {
+		headers[k] = v
+	}
+	message.Headers = headers
+	otel.GetTextMapPropagator().Inject(ctx, amqpCarrier(message.Headers))
+	message.DeliveryMode = amqp091.Persistent
 
 	err = ch.PublishWithContext(ctx,
 		"",
 		p.queue,
+		true,
 		false,
-		false,
-		amqp091.Publishing{
-			DeliveryMode: amqp091.Persistent,
-			ContentType:  "application/json",
-			Headers:      headers,
-			Body:         body,
-		},
+		message,
 	)
 	if err != nil {
 		return fmt.Errorf("publish to %s: %w", p.queue, err)
 	}
 
-	select {
-	case confirm := <-confirmCh:
-		if !confirm.Ack {
-			return fmt.Errorf("publish to %s: message nacked by broker", p.queue)
-		}
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	return nil
+	return amqpconfirm.Await(ctx, fmt.Sprintf("publish to %q", p.queue), confirmCh, returnCh)
 }

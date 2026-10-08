@@ -2,6 +2,7 @@ package ingest
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -18,7 +19,7 @@ type stubSubmitter struct {
 	failAfter int
 }
 
-func (s *stubSubmitter) Submit(e *audit.Event) error {
+func (s *stubSubmitter) Submit(_ context.Context, e *audit.Event) error {
 	if s.failAfter >= 0 && len(s.submitted) >= s.failAfter {
 		return errors.New("buffer full")
 	}
@@ -127,6 +128,21 @@ func TestHTTPHandlerServeHTTPRejectsBatchWithInvalidEvent(t *testing.T) {
 	}
 }
 
+func TestHTTPHandlerRejectsInvalidIDBeforePartialEnqueue(t *testing.T) {
+	buf := &stubSubmitter{failAfter: -1}
+	handler := &HTTPHandler{buf: buf, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	events := []*audit.Event{
+		{Actor: "user", Action: "create", TargetType: "campaign", ScopeType: "tenant"},
+		{ID: "invalid", Actor: "user", Action: "update", TargetType: "campaign", ScopeType: "tenant"},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(mustMarshalJSON(t, httpIngestBody{Events: events})))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || len(buf.submitted) != 0 {
+		t.Fatalf("invalid-ID batch partly accepted: status=%d accepted=%d", rec.Code, len(buf.submitted))
+	}
+}
+
 func mustMarshalJSON(t *testing.T, v any) []byte {
 	t.Helper()
 
@@ -135,4 +151,16 @@ func mustMarshalJSON(t *testing.T, v any) []byte {
 		t.Fatalf("marshal json: %v", err)
 	}
 	return b
+}
+
+func TestHTTPDoesNotAcceptUnconfirmedBatch(t *testing.T) {
+	buf := &stubSubmitter{failAfter: 1}
+	handler := &HTTPHandler{buf: buf, logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	event := &audit.Event{Actor: "user", Action: "update", TargetType: "campaign", ScopeType: "tenant"}
+	req := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(mustMarshalJSON(t, httpIngestBody{Events: []*audit.Event{event, event}})))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable || len(buf.submitted) != 1 {
+		t.Fatalf("unconfirmed batch accepted: status=%d count=%d", rec.Code, len(buf.submitted))
+	}
 }

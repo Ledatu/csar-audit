@@ -24,8 +24,24 @@ Central audit service for the CSAR stack. It ingests audit events, buffers them 
 - `csar-core` for config loading, TLS, gateway context, HTTP helpers, health, and observability.
 - `csar-proto` for the audit ingest protobuf API.
 
+## Event Identity And Replay
+- Ingest prepares owned events with stable UUIDs and timestamps before queueing.
+- Transaction-local staging preserves IDs for small/bulk writes; exact replays
+  are idempotent, conflicting contents roll back the batch without overwrite.
+- The optional gRPC event ID is field 14; deploy upgraded audit instances before
+  producer upgrades. ID-less messages already queued have weaker replay guarantees.
+- HTTP/gRPC success waits for persistent mandatory publication and broker confirmation.
+  PG outages retain unacknowledged batches with backoff; invalid/conflicting events
+  require confirmed quarantine before individual ACK. Failed receipts remain uncertain.
+- Audit-only unlimited-redelivery policy is verified against RabbitMQ 4.3.6.
+  Selected producer outboxes and PG/S3 archive jobs are implemented;
+  partitioning and retention remain planned. Production activation is pending;
+  verify compatible images, broker policy and pooler before rollout.
+- Isolated SQL tests use `AUDIT_TEST_DATABASE_URL`, restricted to a local database
+  named `csar_audit_test`. Check TEMP privileges/pooler affinity before deployment.
+
 ## Audit Hotspots
-- Trust is deployment-sensitive because `http.allowed_client_cn` is empty in prod config and the service relies on mTLS plus router placement.
+- Trust is deployment-sensitive because mTLS and router placement enforce ingress; prod requires client CN `csar-client`.
 - gRPC reflection is enabled in prod config and should stay internal-only.
 - Ingest buffering and consumer throughput are the main failure domains under load.
 
@@ -47,3 +63,51 @@ Central audit service for the CSAR stack. It ingests audit events, buffers them 
 - `go build ./...`
 - `go test ./... -count=1`
 - `golangci-lint run ./...`
+
+## Verified logical archive (activation pending, October 8)
+- `archive.enabled` is false by default and startup-only. Explicit environment,
+  bucket, endpoint, region and existing secret auth are required before enabling.
+  The worker uses core S3 streaming/version APIs; it has no deletion path.
+- Migration 004 adds nullable canonical `received_at`; historical timestamps
+  remain unknown, future inserts default to DB receipt time, exact replay never
+  changes the first receipt. The physical event table is not partitioned here.
+- Persistent job/member rows select committed unarchived events, with one-hour
+  receipt lag and no timestamp cursor. Claims override session isolation to
+  READ COMMITTED and are fenced by token/180s lease; work is capped at 150s.
+  Batches have at most 200 rows and 32MiB uncompressed content, with conservative
+  SQL byte budgeting before fetching event payloads.
+- Data upload, full pinned download verification, manifest upload and pinned
+  manifest verification precede catalog advancement. Persistent states are
+  planned/catalogued; uncertain intermediate IO retains planned membership.
+  Conditional writes reuse original versions across retries.
+- `Restore` verifies a pinned manifest and complete data before returning any
+  records; it neither authorizes a caller nor imports a database. Preserves IDs,
+  occurred/receipt timestamps, counts and checksums. Automatic catalog discovery/
+  rebuild and authorized cold queries remain unimplemented.
+- Lag collectors include unverified jobs and fail visibly on query errors.
+  Full backlog scans and membership/catalog growth need clone capacity tests.
+  FK membership protects hot rows; it is not sealed-partition retirement proof.
+- Local PG 18.6 and fake SDK/IAM object endpoints test crash/lost receipt, lease
+  failover, late commits and corruption. Independent copy and production capacity
+  remain activation gates. No historical deletion/expiry.
+
+## Archive operator and live preflight (October 8)
+- `cmd/csar-audit-archive` has `verify`, `restore-local`, `probe`, `probe-replay`.
+  It accepts archive-only configuration and a pinned receipt, enforces byte/time
+  bounds, prints metadata only and never starts runtime services or broker clients.
+- Imports accept only loopback `csar_audit_restore`, reject fallback hosts, pin
+  localhost to 127.0.0.1 and reset schema/options. Verified chunks import atomically
+  through existing store staging/deduplication. `RestoreBatch` preserves receipt
+  times/NULLs and rejects receipt/content conflicts without overwrite. This tool
+  is not an authorized production restore/cutover path.
+- Dedicated `aurumskynet-audit-prod` is private, versioned, KMS-encrypted with a
+  protected separate key and 64GiB bootstrap cap. Writer verifies versions; reader
+  has version reads/listing. Both lack deletion rights; unconditional PUT is denied.
+  No lifecycle expiry. Credential state is private and outside source checkouts.
+- At 19:36 MSK two synthetic events passed actual Yandex upload, pinned verification,
+  conditional replay with unchanged versions, recovery-reader verification and
+  two isolated PG 18.6 imports with exactly two rows/IDs and preserved receipt/NULL.
+  Objects are retained; no business history was uploaded. Production remains off.
+- See `ops/archive/reader.example.yaml`, `bucket-policy.template.json`, README and
+  `plans/2026-10-08-audit-s3-preflight.json`. The Docker image packages the CLI alongside the server.
+  Compatible core/proto/image releases precede runtime activation.

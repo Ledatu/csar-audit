@@ -7,10 +7,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -ldflags "-s -w -X main.Version=${VERSION}" -o /csar-audit ./cmd/csar-audit
+RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /csar-audit-archive ./cmd/csar-audit-archive
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 RUN adduser -D -u 10001 csar
 COPY --from=builder /csar-audit /usr/local/bin/csar-audit
+COPY --from=builder /csar-audit-archive /usr/local/bin/csar-audit-archive
 USER csar
 ENTRYPOINT ["csar-audit"]

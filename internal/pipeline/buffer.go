@@ -1,4 +1,4 @@
-// Package pipeline bridges validated ingest events to RabbitMQ publishers.
+// Package pipeline bridges validated ingest events to confirmed RabbitMQ publication.
 package pipeline
 
 import (
@@ -9,51 +9,60 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ledatu/csar-audit/internal/rmq"
 	"github.com/ledatu/csar-core/audit"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// ErrFull is returned when the in-memory buffer cannot accept another event.
-var ErrFull = errors.New("audit pipeline buffer full")
+var (
+	ErrFull   = errors.New("audit pipeline buffer full")
+	ErrClosed = errors.New("audit pipeline closed")
+)
 
-// BufferMetrics is the subset of metrics the buffer writes to.
 type BufferMetrics struct {
 	EventsPublished prometheus.Counter
 	EventsDropped   *prometheus.CounterVec
 }
 
-// Buffer is a bounded channel of event pointers drained by workers that publish to RabbitMQ.
-// Callers must not mutate an Event after Submit returns successfully.
-type Buffer struct {
-	ch       chan *audit.Event
-	capacity int
-	pub      *rmq.Publisher
-	logger   *slog.Logger
-	metrics  *BufferMetrics
-
-	wg sync.WaitGroup
+type Publisher interface {
+	PublishRaw(context.Context, []byte) error
 }
 
-// NewBuffer starts publisher workers that drain the buffer until Close.
-// metrics may be nil (no-op instrumentation).
-func NewBuffer(depth int, workers int, pub *rmq.Publisher, logger *slog.Logger, m *BufferMetrics) *Buffer {
+type request struct {
+	ctx    context.Context
+	event  *audit.Event
+	result chan error
+}
+
+// Buffer owns pending events; Submit returns only after a confirmed publication.
+type Buffer struct {
+	ch       chan request
+	capacity int
+	pub      Publisher
+	logger   *slog.Logger
+	metrics  *BufferMetrics
+	timeout  time.Duration
+	ctx      context.Context
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+	closed   bool
+	wg       sync.WaitGroup
+}
+
+func NewBuffer(depth, workers int, pub Publisher, logger *slog.Logger, m *BufferMetrics, timeout time.Duration) *Buffer {
 	if depth < 1 {
 		depth = 1
 	}
 	if workers < 1 {
 		workers = 1
 	}
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
-	b := &Buffer{
-		ch:       make(chan *audit.Event, depth),
-		capacity: depth,
-		pub:      pub,
-		logger:   logger.With("component", "audit_pipeline"),
-		metrics:  m,
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	b := &Buffer{ch: make(chan request, depth), capacity: depth, pub: pub, logger: logger.With("component", "audit_pipeline"), metrics: m, timeout: timeout, ctx: ctx, cancel: cancel}
 	for range workers {
 		b.wg.Add(1)
 		go b.worker()
@@ -61,81 +70,89 @@ func NewBuffer(depth int, workers int, pub *rmq.Publisher, logger *slog.Logger, 
 	return b
 }
 
-// Depth returns the number of events waiting in the buffer.
-func (b *Buffer) Depth() int {
-	return len(b.ch)
-}
+func (b *Buffer) Depth() int    { return len(b.ch) }
+func (b *Buffer) Capacity() int { return b.capacity }
 
-// Capacity returns the buffer channel capacity.
-func (b *Buffer) Capacity() int {
-	return b.capacity
-}
-
-// Submit enqueues a non-blocking event. Returns ErrFull when the buffer is saturated.
-func (b *Buffer) Submit(e *audit.Event) error {
-	if e == nil {
-		return errors.New("nil audit event")
+// Submit waits for broker confirmation, bounded by both caller and receipt timeout.
+// A failed/lost receipt can mean uncertain delivery: retry with the same event ID.
+func (b *Buffer) Submit(ctx context.Context, e *audit.Event) error {
+	prepared, err := audit.PrepareEvent(e)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, b.timeout)
+	defer cancel()
+	stop := context.AfterFunc(b.ctx, cancel)
+	defer stop()
+	req := request{ctx: ctx, event: prepared, result: make(chan error, 1)}
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		b.mu.Unlock()
+		return err
 	}
 	select {
-	case b.ch <- e:
-		return nil
+	case b.ch <- req:
+		b.mu.Unlock()
 	default:
-		b.logger.Warn("audit buffer full, event dropped",
-			"action", e.Action,
-			"service", e.Service,
-		)
-		if b.metrics != nil {
-			b.metrics.EventsDropped.WithLabelValues("buffer_full").Inc()
-		}
+		b.mu.Unlock()
+		b.rejected("buffer_full")
 		return ErrFull
+	}
+	select {
+	case err := <-req.result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *Buffer) rejected(reason string) {
+	if b.metrics != nil {
+		b.metrics.EventsDropped.WithLabelValues(reason).Inc()
 	}
 }
 
 func (b *Buffer) worker() {
 	defer b.wg.Done()
-	for e := range b.ch {
-		b.publishWithRetry(e)
+	for req := range b.ch {
+		err := b.publish(req)
+		req.result <- err
 	}
 }
 
-func (b *Buffer) publishWithRetry(e *audit.Event) {
-	if e == nil {
-		return
+func (b *Buffer) publish(req request) error {
+	if err := req.ctx.Err(); err != nil {
+		return err
 	}
-	body, err := json.Marshal(e)
+	body, err := json.Marshal(req.event)
 	if err != nil {
-		b.logger.Error("audit encode failed", "error", err)
-		if b.metrics != nil {
-			b.metrics.EventsDropped.WithLabelValues("encode_error").Inc()
-		}
-		return
+		b.rejected("encode_error")
+		return err
 	}
-	const maxAttempts = 4
-	backoff := 100 * time.Millisecond
-	for attempt := range maxAttempts {
-		if attempt > 0 {
-			time.Sleep(backoff)
-			backoff = min(backoff*2, 5*time.Second)
-		}
-		pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err = b.pub.PublishRaw(pctx, body)
-		cancel()
-		if err == nil {
-			if b.metrics != nil {
-				b.metrics.EventsPublished.Inc()
-			}
-			return
-		}
-		b.logger.Warn("audit publish failed", "error", err, "attempt", attempt+1)
+	err = b.pub.PublishRaw(req.ctx, body)
+	if err != nil {
+		b.rejected("publish_uncertain")
+		b.logger.Warn("audit publication not confirmed", "error", err)
+		return err
 	}
-	b.logger.Error("audit publish exhausted retries", "error", err)
 	if b.metrics != nil {
-		b.metrics.EventsDropped.WithLabelValues("publish_error").Inc()
+		b.metrics.EventsPublished.Inc()
 	}
+	return nil
 }
 
-// Close drains the buffer then stops workers.
+// Close cancels pending receipts and joins workers. Concurrent Submit is safe.
 func (b *Buffer) Close() {
-	close(b.ch)
+	b.mu.Lock()
+	if !b.closed {
+		b.closed = true
+		b.cancel()
+		close(b.ch)
+	}
+	b.mu.Unlock()
 	b.wg.Wait()
 }

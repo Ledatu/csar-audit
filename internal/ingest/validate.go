@@ -9,35 +9,12 @@ import (
 )
 
 const (
-	maxBeforeStateBytes = 64 * 1024
-	maxMetadataBytes    = 16 * 1024
+	maxBeforeStateBytes = audit.MaxStateBytes
+	maxMetadataBytes    = audit.MaxMetadataBytes
 )
 
 // Validate checks mandatory audit fields.
-func Validate(e *audit.Event) error {
-	if e == nil {
-		return fmt.Errorf("nil event")
-	}
-	if e.Actor == "" {
-		return fmt.Errorf("actor is required")
-	}
-	if e.Action == "" {
-		return fmt.Errorf("action is required")
-	}
-	if e.TargetType == "" {
-		return fmt.Errorf("target_type is required")
-	}
-	if e.ScopeType == "" {
-		return fmt.Errorf("scope_type is required")
-	}
-	if len(e.BeforeState) > maxBeforeStateBytes {
-		return fmt.Errorf("before_state exceeds %d bytes", maxBeforeStateBytes)
-	}
-	if len(e.Metadata) > maxMetadataBytes {
-		return fmt.Errorf("metadata exceeds %d bytes", maxMetadataBytes)
-	}
-	return nil
-}
+func Validate(e *audit.Event) error { return audit.ValidateEvent(e) }
 
 // FromProto maps a protobuf AuditEvent to the shared core type.
 func FromProto(pb *auditv1.AuditEvent) (audit.Event, error) {
@@ -45,6 +22,7 @@ func FromProto(pb *auditv1.AuditEvent) (audit.Event, error) {
 		return audit.Event{}, fmt.Errorf("nil event")
 	}
 	e := audit.Event{
+		ID:          pb.Id,
 		Service:     pb.Service,
 		Actor:       pb.Actor,
 		Action:      pb.Action,

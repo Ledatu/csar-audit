@@ -1,0 +1,13 @@
+# Operator-only configuration. Keep the real file protected; use the dedicated
+# recovery reader, never the runtime writer or configuration-manifest identity.
+archive:
+  enabled: false
+  environment: prod # use preflight for the retained synthetic drill
+  bucket: aurumskynet-audit-prod
+  endpoint: https://storage.yandexcloud.net
+  region: ru-central1
+  prefix: ""
+  auth:
+    auth_mode: static
+    access_key_id: "${AUDIT_ARCHIVE_READER_ACCESS_KEY_ID}"
+    secret_access_key: "${AUDIT_ARCHIVE_READER_SECRET_ACCESS_KEY}"
