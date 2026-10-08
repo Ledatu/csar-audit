@@ -40,8 +40,11 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, output io.Writer) error {
+	if len(args) > 0 && args[0] == "replicate" {
+		return runReplicate(ctx, args[1:], output)
+	}
 	if len(args) == 0 || (args[0] != "verify" && args[0] != "restore-local" && args[0] != "probe" && args[0] != "probe-replay") {
-		return errors.New("usage: csar-audit-archive {verify|restore-local|probe|probe-replay} --config reader.yaml --receipt-file receipt.json")
+		return errors.New("usage: csar-audit-archive {verify|restore-local|probe|probe-replay|replicate}; explicit command configuration and receipt flags required")
 	}
 	command := args[0]
 	if command == "restore-local" {
