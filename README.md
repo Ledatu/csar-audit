@@ -71,6 +71,7 @@ grpc:
   reflection: true        # enable gRPC reflection (disable in prod if needed)
 
 database:
+  ingest_only: false            # startup-only temporary PG pause; see below
   dsn: "${AUDIT_DATABASE_URL}"    # required — Postgres connection string
 
 rabbitmq:
@@ -156,6 +157,52 @@ The gRPC contract adds optional UUID field `id` at field number 14. Upgrade all
 audit consumers/ingest instances before producers: older consumers ignore IDs
 and cannot provide the new deduplication behavior. Existing queued messages
 without IDs remain readable but cannot reliably deduplicate on redelivery.
+
+### Temporary PG migration mode
+
+`database.ingest_only: true` keeps HTTP/gRPC ingestion with mandatory persistent
+publisher confirms, without opening a PostgreSQL pool. Consumer, migrations,
+archive worker and PG readiness probes are skipped. The DSN may be absent in
+this mode; enabled archive work is rejected. Authenticated audit history queries
+return503. Existing mTLS and gateway trust configuration still applies.
+
+Readiness checks broker connectivity and explicitly reports `audit_persistence`
+as intentionally paused; it means ready to **ingest**, not ready to query or
+persist. `audit_persistence_paused` is1 and the startup log records the mode.
+Normal mode remains the default, requires PG and exposes the gauge as0. This
+flag is startup-only; publishing YAML without recreating instances cannot pause
+an existing consumer. A PG outage never silently selects this mode.
+
+Before activation, verify the actual vhost, both quorum queues' online members,
+delivery-limit=-1 policy, absence of expiry/drop policies, broker alarms and disk
+headroom. Monitor ready/unacknowledged/byte backlog throughout the pause. Recreate
+every audit instance with this mode while preserving ingress availability; then
+require zero consumers, zero unacknowledged deliveries and no source audit write
+transactions. Consumer disconnect requeues unsettled messages; a committed but
+unacknowledged delivery can replay, so retain its original ID/timestamp. Also
+exclude archive/COPY/external writers before declaring the source stable.
+
+Export/restore and verify stable source history while producers continue to
+publish. After the target passes acceptance and its route is selected, recreate
+instances with `ingest_only: false` and the target DSN. Observe backlog drain,
+individual ACKs after PG commit, quarantine and idempotent replay. Older ID-less
+messages need separate review. Keep historical source/evidence; rollback after
+new target writes requires reconciliation. Audit events do not constitute a
+complete reconstructable change journal for other services.
+
+Local synthetic drill (Docker required):
+
+```bash
+GOWORK=off go build -o /tmp/audit-ingest-drill ./cmd/csar-audit
+python3 ops/ingest_only_drill.py --binary /tmp/audit-ingest-drill
+```
+
+It tests confirmed ingress with an invalid/unparsed PG DSN, zero consumers,
+query503, explicit metrics, broker failure503, durable backlog across broker
+restart and subsequent PG18.6 persistence/deduplication. Fixture containers and
+volumes are stopped and retained. It uses temporary native development listeners
+with TLS disabled and synthetic credentials; do not run it on production hosts.
+Single-node synthetic quorum is not proof of production three-member resilience.
 
 ### Confirmed acceptance and quarantine
 

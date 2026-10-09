@@ -92,3 +92,26 @@ func TestArchiveRequiresExplicitDestination(t *testing.T) {
 		}
 	}
 }
+
+func TestIngestOnlyRequiresExplicitChoiceAndDisablesArchive(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		ok   bool
+	}{
+		{"explicit no DSN", "database:\n  ingest_only: true\n", true},
+		{"normal no DSN", "database:\n  ingest_only: false\n", false},
+		{"default no DSN", "", false},
+		{"conflicting archive", "database:\n  ingest_only: true\narchive:\n  enabled: true\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadFromBytes([]byte("rabbitmq:\n  url: amqp://test\n" + tc.body))
+			if (err == nil) != tc.ok {
+				t.Fatalf("accepted=%v want=%v err=%v", err == nil, tc.ok, err)
+			}
+			if tc.ok && !cfg.Database.IngestOnly {
+				t.Fatal("explicit ingest-only lost")
+			}
+		})
+	}
+}

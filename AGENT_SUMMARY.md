@@ -1,5 +1,15 @@
 # csar-audit Agent Summary
 
+## Temporary PG migration mode (October9 source)
+- Startup-only `database.ingest_only`, default false, accepts confirmed
+  RabbitMQ receipts with no PG pool, migrations, consumer, archive or PG probe.
+- Authenticated history queries return503; broker connectivity remains required
+  for ingestion readiness. Readiness explicitly reports intentional persistence
+  pause and `audit_persistence_paused` is1. Archive enabled is incompatible.
+- See `cmd/csar-audit/persistence.go`, configuration/HTTP tests, README activation
+  gates and `ops/ingest_only_drill.py`. Published source is preparation; actual
+  mode activation and production cutover require a coordinated rollout.
+
 ## Role In Prod
 Central audit service for the CSAR stack. It ingests audit events, buffers them through RabbitMQ, persists them in PostgreSQL, and exposes an admin query surface through the router.
 
