@@ -14,6 +14,7 @@ type Metrics struct {
 	BatchFlushSeconds prometheus.Histogram
 	EventsWritten     prometheus.Counter
 	ConsumerErrors    *prometheus.CounterVec
+	PersistencePaused prometheus.Gauge
 }
 
 // DepthFunc returns the current buffer depth.
@@ -22,6 +23,11 @@ type DepthFunc func() float64
 // New creates and registers all metrics on the given registry.
 func New(reg *prometheus.Registry, depthFn DepthFunc) *Metrics {
 	m := &Metrics{
+		PersistencePaused: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "audit",
+			Name:      "persistence_paused",
+			Help:      "1 when startup-only ingest mode intentionally disables all PostgreSQL access.",
+		}),
 		IngestTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "audit",
 			Name:      "ingest_total",
@@ -81,6 +87,7 @@ func New(reg *prometheus.Registry, depthFn DepthFunc) *Metrics {
 	}
 
 	reg.MustRegister(
+		m.PersistencePaused,
 		m.IngestTotal,
 		m.IngestDuration,
 		m.BufferDepth,

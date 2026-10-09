@@ -64,6 +64,9 @@ type GRPCConfig struct {
 // DatabaseConfig holds Postgres DSN.
 type DatabaseConfig struct {
 	DSN string `yaml:"dsn"`
+	// IngestOnly is startup-only: accept confirmed broker receipts while all
+	// PostgreSQL access (consumer, queries, migrations, archive) is paused.
+	IngestOnly bool `yaml:"ingest_only"`
 }
 
 // RabbitMQConfig holds broker URL and reconnect tuning.
@@ -184,12 +187,15 @@ func defaults(cfg *Config) {
 }
 
 func (c *Config) validate() error {
+	if c.Database.IngestOnly && c.Archive.Enabled {
+		return fmt.Errorf("archive must be disabled in database.ingest_only mode")
+	}
 	if c.Archive.Enabled {
 		if err := c.Archive.Validate(); err != nil {
 			return err
 		}
 	}
-	if c.Database.DSN == "" {
+	if c.Database.DSN == "" && !c.Database.IngestOnly {
 		return fmt.Errorf("database.dsn is required")
 	}
 	if c.RabbitMQ.URL == "" {

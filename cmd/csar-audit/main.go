@@ -21,7 +21,6 @@ import (
 	"github.com/ledatu/csar-audit/internal/pipeline"
 	"github.com/ledatu/csar-audit/internal/query"
 	"github.com/ledatu/csar-audit/internal/rmq"
-	"github.com/ledatu/csar-audit/internal/store"
 	"github.com/ledatu/csar-core/configload"
 	"github.com/ledatu/csar-core/gatewayctx"
 	"github.com/ledatu/csar-core/health"
@@ -29,7 +28,6 @@ import (
 	"github.com/ledatu/csar-core/httpserver"
 	"github.com/ledatu/csar-core/logutil"
 	"github.com/ledatu/csar-core/observe"
-	"github.com/ledatu/csar-core/pgutil"
 	"github.com/ledatu/csar-core/s3store"
 	"github.com/ledatu/csar-core/tlsx"
 	auditv1 "github.com/ledatu/csar-proto/csar/audit/v1"
@@ -92,15 +90,12 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 
 	reg := observe.NewRegistry()
 
-	pool, err := pgutil.NewPool(ctx, cfg.Database.DSN, pgutil.WithLogger(logger.With("component", "postgres")))
+	pool, pgStore, err := openPostgres(ctx, cfg, logger)
 	if err != nil {
-		return fmt.Errorf("postgres: %w", err)
+		return err
 	}
-	defer pool.Close()
-
-	pgStore := store.NewPostgres(pool, logger.With("component", "audit_store"))
-	if err := pgStore.Migrate(ctx); err != nil {
-		return fmt.Errorf("migrate: %w", err)
+	if pool != nil {
+		defer pool.Close()
 	}
 
 	rmqCfg := rmq.ConnectionConfig{
@@ -126,6 +121,10 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 		}
 		return 0
 	})
+	if cfg.Database.IngestOnly {
+		m.PersistencePaused.Set(1)
+		logger.Warn("audit persistence intentionally paused; ingestion requires broker confirmation")
+	}
 
 	buf := pipeline.NewBuffer(cfg.Ingest.BufferSize, cfg.Ingest.PublisherWorkers, pub, logger, &pipeline.BufferMetrics{
 		EventsPublished: m.EventsPublished,
@@ -155,16 +154,22 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 		go func() { defer close(archiveDone); worker.Run(archiveCtx, logger.With("component", "archive")) }()
 		defer func() { stopArchive(); <-archiveDone; _ = objects.Close() }()
 	}
-	go consumer.Run(appCtx, cm, pgStore, cfg, logger, &consumer.ConsumerMetrics{
-		BatchSize:         m.BatchSize,
-		BatchFlushSeconds: m.BatchFlushSeconds,
-		EventsWritten:     m.EventsWritten,
-		ConsumerErrors:    m.ConsumerErrors,
-	})
+	if !cfg.Database.IngestOnly {
+		go consumer.Run(appCtx, cm, pgStore, cfg, logger, &consumer.ConsumerMetrics{
+			BatchSize:         m.BatchSize,
+			BatchFlushSeconds: m.BatchFlushSeconds,
+			EventsWritten:     m.EventsWritten,
+			ConsumerErrors:    m.ConsumerErrors,
+		})
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("POST /ingest", ingest.NewHTTPHandler(buf, logger, cfg.Ingest.ReceiptTimeout.Std()))
-	query.New(pgStore).Register(mux)
+	var lister query.Lister
+	if pgStore != nil {
+		lister = pgStore
+	}
+	query.New(lister).Register(mux)
 
 	trust := buildTrustFunc(cfg)
 	httpStack := httpmiddleware.Chain(
@@ -220,14 +225,20 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 		}
 		return health.CheckStatus{Status: "fail", Detail: "not connected"}
 	})
-	rc.Register("postgres", func() health.CheckStatus {
-		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := pool.Ping(cctx); err != nil {
-			return health.CheckStatus{Status: "fail", Detail: err.Error()}
-		}
-		return health.CheckStatus{Status: "ok"}
-	})
+	if cfg.Database.IngestOnly {
+		rc.Register("audit_persistence", func() health.CheckStatus {
+			return health.CheckStatus{Status: "ok", Detail: "ingest-only: PG persistence paused; events retained in RabbitMQ"}
+		})
+	} else {
+		rc.Register("postgres", func() health.CheckStatus {
+			cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := pool.Ping(cctx); err != nil {
+				return health.CheckStatus{Status: "fail", Detail: err.Error()}
+			}
+			return health.CheckStatus{Status: "ok"}
+		})
+	}
 	rc.Register("audit_buffer", func() health.CheckStatus {
 		capacity := buf.Capacity()
 		if capacity == 0 {
