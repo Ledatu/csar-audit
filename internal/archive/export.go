@@ -74,7 +74,7 @@ func Export(ctx context.Context, objects Objects, environment, batchID string, p
 		return nil, closeErr
 	}
 	manifest := Manifest{
-		SchemaVersion: SchemaVersion, BatchID: batchID, Environment: environment, PlannedAt: plannedAt.UTC(),
+		SchemaVersion: descriptor.SchemaVersion, BatchID: batchID, Environment: environment, PlannedAt: plannedAt.UTC(),
 		DataKey: dataKey, DataVersionID: dataReceipt.VersionID, Chunk: descriptor,
 	}
 	encoded, err := json.Marshal(&manifest)

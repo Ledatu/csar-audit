@@ -168,7 +168,7 @@ func (j *Jobs) Claim(ctx context.Context, environment string) (*Job, error) {
 	return job, nil
 }
 
-const recordProjection = `e.id::text,e.service,e.actor,e.action,e.target_type,e.target_id,e.scope_type,e.scope_id,e.before_state,e.after_state,e.metadata,e.request_id,e.client_ip,e.created_at,e.received_at`
+const recordProjection = `e.id::text,e.service,e.actor,e.action,e.target_type,e.target_id,e.scope_type,e.scope_id,e.before_state,e.after_state,e.metadata,e.request_id,e.client_ip,e.created_at,e.received_at,e.caller,e.origin_caller,e.operation_id,e.parent_operation_id,e.trace_id`
 
 func scanRecords(rows pgx.Rows) ([]Record, error) {
 	defer rows.Close()
@@ -176,7 +176,8 @@ func scanRecords(rows pgx.Rows) ([]Record, error) {
 	for rows.Next() {
 		var record Record
 		e := &record.Event
-		if err := rows.Scan(&e.ID, &e.Service, &e.Actor, &e.Action, &e.TargetType, &e.TargetID, &e.ScopeType, &e.ScopeID, &e.BeforeState, &e.AfterState, &e.Metadata, &e.RequestID, &e.ClientIP, &e.CreatedAt, &record.ReceivedAt); err != nil {
+		if err := rows.Scan(&e.ID, &e.Service, &e.Actor, &e.Action, &e.TargetType, &e.TargetID, &e.ScopeType, &e.ScopeID, &e.BeforeState, &e.AfterState, &e.Metadata, &e.RequestID, &e.ClientIP, &e.CreatedAt, &record.ReceivedAt,
+			&e.Caller, &e.OriginCaller, &e.OperationID, &e.ParentOperationID, &e.TraceID); err != nil {
 			return nil, err
 		}
 		records = append(records, record)
@@ -217,7 +218,7 @@ func (j *Jobs) Complete(ctx context.Context, job *Job, receipt *ExportReceipt) e
 		return err
 	}
 	m := &receipt.Manifest
-	if m.SchemaVersion != SchemaVersion || m.Chunk.SchemaVersion != SchemaVersion || m.BatchID != job.ID || m.Environment != job.Environment || !m.PlannedAt.Equal(job.PlannedAt) || m.Chunk.Rows != job.Rows || m.Chunk.EventIDsSHA256 != job.Coverage || receipt.ManifestKey != prefix+"manifest.json" || m.DataKey != prefix+"events-0001.ndjson.gz" || !pinnedVersion(m.DataVersionID) || !pinnedVersion(receipt.ManifestVersionID) {
+	if !supportedSchema(m.SchemaVersion) || m.Chunk.SchemaVersion != m.SchemaVersion || m.BatchID != job.ID || m.Environment != job.Environment || !m.PlannedAt.Equal(job.PlannedAt) || m.Chunk.Rows != job.Rows || m.Chunk.EventIDsSHA256 != job.Coverage || receipt.ManifestKey != prefix+"manifest.json" || m.DataKey != prefix+"events-0001.ndjson.gz" || !pinnedVersion(m.DataVersionID) || !pinnedVersion(receipt.ManifestVersionID) {
 		return errors.New("archive receipt does not cover claimed job")
 	}
 	body, err := json.Marshal(receipt)

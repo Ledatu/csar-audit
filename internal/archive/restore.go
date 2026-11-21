@@ -51,7 +51,7 @@ func Restore(ctx context.Context, objects Objects, manifestKey, version string) 
 	if err != nil {
 		return nil, nil, err
 	}
-	if manifest.SchemaVersion != SchemaVersion || manifestKey != prefix+"manifest.json" || manifest.DataKey != prefix+"events-0001.ndjson.gz" || !pinnedVersion(manifest.DataVersionID) {
+	if !supportedSchema(manifest.SchemaVersion) || manifest.SchemaVersion != manifest.Chunk.SchemaVersion || manifestKey != prefix+"manifest.json" || manifest.DataKey != prefix+"events-0001.ndjson.gz" || !pinnedVersion(manifest.DataVersionID) {
 		return nil, nil, errors.New("archive manifest reference/version mismatch")
 	}
 	reader, err = objects.Open(ctx, manifest.DataKey, manifest.DataVersionID, manifest.Chunk.CompressedBytes)
