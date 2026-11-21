@@ -1,7 +1,11 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"testing"
 
 	"github.com/ledatu/csar-core/audit"
@@ -10,6 +14,27 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func TestHTTPCallerContextReachesConfirmedQueue(t *testing.T) {
+	e := &audit.Event{Actor: "owner", Action: "report.read", TargetType: "report", ScopeType: "tenant", OperationID: "op:1",
+		Caller: &caller.Identity{Version: caller.Version, CallerKind: caller.Application, CallerID: "app:1",
+			OwnerSubject: "user:1", EffectiveSubject: "user:1", CredentialKind: caller.APIKey, CredentialID: "key:1", Assurance: caller.Verified}}
+	buf := &stubSubmitter{failAfter: -1}
+	h := &HTTPHandler{buf: buf}
+	send := func() int {
+		r := httptest.NewRequest(http.MethodPost, "/ingest", bytes.NewReader(mustMarshalJSON(t, httpIngestBody{Events: []*audit.Event{e}})))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	if code := send(); code != http.StatusAccepted || len(buf.submitted) != 1 || !reflect.DeepEqual(buf.submitted[0], e) {
+		t.Fatal("HTTP lost caller context before confirmed queue", code)
+	}
+	e.Caller.Version = 2
+	if code := send(); code != http.StatusBadRequest || len(buf.submitted) != 1 {
+		t.Fatal("malformed HTTP caller reached queue", code)
+	}
+}
 
 func TestGRPCCallerContextReachesConfirmedQueue(t *testing.T) {
 	e := &audit.Event{Actor: "owner", Action: "report.read", TargetType: "report", ScopeType: "tenant", OperationID: "op:1",

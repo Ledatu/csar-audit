@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ledatu/csar-core/audit"
+	"github.com/ledatu/csar-core/caller"
 )
 
 type blockingPublisher struct {
@@ -34,16 +35,20 @@ func TestSubmitWaitsForConfirmationAndOwnsEvent(t *testing.T) {
 	pub := &blockingPublisher{started: make(chan []byte, 1), receipt: make(chan error, 1)}
 	b := NewBuffer(1, 1, pub, nil, nil, time.Second)
 	defer b.Close()
-	event := &audit.Event{Metadata: json.RawMessage(`{"x":1}`)}
+	event := &audit.Event{Metadata: json.RawMessage(`{"x":1}`), OperationID: "op:1",
+		Caller: &caller.Identity{Version: caller.Version, CallerKind: caller.Agent, CallerID: "agent:1",
+			OwnerSubject: "user:1", EffectiveSubject: "user:1", CredentialKind: caller.APIKey, CredentialID: "key:1", Assurance: caller.Verified}}
 	done := make(chan error, 1)
 	go func() { done <- b.Submit(context.Background(), event) }()
 	body := <-pub.started
 	event.Metadata[5] = '9'
+	event.Caller.CredentialID = "key:changed"
 	var queued audit.Event
 	if err := json.Unmarshal(body, &queued); err != nil {
 		t.Fatal(err)
 	}
-	if queued.ID == "" || queued.CreatedAt.IsZero() || string(queued.Metadata) != `{"x":1}` {
+	if queued.ID == "" || queued.CreatedAt.IsZero() || string(queued.Metadata) != `{"x":1}` ||
+		queued.Caller == nil || queued.Caller.CredentialID != "key:1" || queued.OperationID != "op:1" {
 		t.Fatal("missing identity or owned payload")
 	}
 	select {
