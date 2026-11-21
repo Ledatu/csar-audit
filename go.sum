@@ -66,8 +66,12 @@ github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
 github.com/ledatu/csar-core v0.1.44 h1:InJ8aSsw1NfpHdlxiZTI84KlbzdkgYtBj1ZYBfsUrm4=
 github.com/ledatu/csar-core v0.1.44/go.mod h1:YI7sPdV/ECwpjLf9bvZTUs8ASanNoMnsokbRvHtOkr4=
+github.com/ledatu/csar-core v0.1.48-0.20261121191331-e5edf071763e h1:uZkszj7rIQCI1aL2iQkcz7DTnheMqsG+D8fatQSq76s=
+github.com/ledatu/csar-core v0.1.48-0.20261121191331-e5edf071763e/go.mod h1:iSj26NJP4FLlID5OJYDlArjMF9ibYqA5CrL1D0SMV/Q=
 github.com/ledatu/csar-proto v0.1.5 h1:w9/Kx8FlMYuGRdAINkYtdBkjCm+u2WYG5SkkzaP+rQI=
 github.com/ledatu/csar-proto v0.1.5/go.mod h1:9dGkHdtL22s3u7ENmRfOlaifCyLKiMYnXThLVnZZV5Y=
+github.com/ledatu/csar-proto v0.1.6-0.20261121190525-036c52b2db12 h1:qxdAqGtiMsMvsq8kezmVI2+B1qxlgoW4RkT4kAwrM08=
+github.com/ledatu/csar-proto v0.1.6-0.20261121190525-036c52b2db12/go.mod h1:9dGkHdtL22s3u7ENmRfOlaifCyLKiMYnXThLVnZZV5Y=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=

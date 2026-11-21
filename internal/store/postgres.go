@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/ledatu/csar-core/audit"
+	"github.com/ledatu/csar-core/caller"
 	"github.com/ledatu/csar-core/pgutil"
 )
 
@@ -91,12 +92,27 @@ CREATE INDEX IF NOT EXISTS idx_audit_created_at
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS received_at timestamptz;
 ALTER TABLE audit_events ALTER COLUMN received_at SET DEFAULT clock_timestamp();
 `},
+	{Name: "005_token_caller_identity", Up: `
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS caller jsonb;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS origin_caller jsonb;
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS operation_id text NOT NULL DEFAULT '';
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS parent_operation_id text NOT NULL DEFAULT '';
+ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS trace_id text NOT NULL DEFAULT '';
+`},
 }
 
 var copyFromColumns = []string{
 	"id", "service", "actor", "action", "target_type", "target_id",
 	"scope_type", "scope_id", "before_state", "after_state", "metadata",
 	"request_id", "client_ip", "created_at",
+	"caller", "origin_caller", "operation_id", "parent_operation_id", "trace_id",
+}
+
+func callerValue(id *caller.Identity) any {
+	if id == nil {
+		return nil
+	}
+	return id
 }
 
 // Postgres persists audit events for csar-audit (batch writes + list).
@@ -121,21 +137,26 @@ func (s *Postgres) Migrate(ctx context.Context) error {
 // Event is the csar-audit query response shape. It mirrors audit.Event and adds
 // derived fields that are local to the query surface.
 type Event struct {
-	ID          string          `json:"id"`
-	Service     string          `json:"service,omitempty"`
-	Category    string          `json:"category,omitempty"`
-	Actor       string          `json:"actor"`
-	Action      string          `json:"action"`
-	TargetType  string          `json:"target_type"`
-	TargetID    string          `json:"target_id"`
-	ScopeType   string          `json:"scope_type"`
-	ScopeID     string          `json:"scope_id"`
-	BeforeState json.RawMessage `json:"before_state,omitempty"`
-	AfterState  json.RawMessage `json:"after_state,omitempty"`
-	Metadata    json.RawMessage `json:"metadata,omitempty"`
-	RequestID   string          `json:"request_id,omitempty"`
-	ClientIP    string          `json:"client_ip,omitempty"`
-	CreatedAt   time.Time       `json:"created_at"`
+	ID                string           `json:"id"`
+	Service           string           `json:"service,omitempty"`
+	Category          string           `json:"category,omitempty"`
+	Actor             string           `json:"actor"`
+	Action            string           `json:"action"`
+	TargetType        string           `json:"target_type"`
+	TargetID          string           `json:"target_id"`
+	ScopeType         string           `json:"scope_type"`
+	ScopeID           string           `json:"scope_id"`
+	BeforeState       json.RawMessage  `json:"before_state,omitempty"`
+	AfterState        json.RawMessage  `json:"after_state,omitempty"`
+	Metadata          json.RawMessage  `json:"metadata,omitempty"`
+	RequestID         string           `json:"request_id,omitempty"`
+	ClientIP          string           `json:"client_ip,omitempty"`
+	CreatedAt         time.Time        `json:"created_at"`
+	Caller            *caller.Identity `json:"caller,omitempty"`
+	OriginCaller      *caller.Identity `json:"origin_caller,omitempty"`
+	OperationID       string           `json:"operation_id,omitempty"`
+	ParentOperationID string           `json:"parent_operation_id,omitempty"`
+	TraceID           string           `json:"trace_id,omitempty"`
 }
 
 // ListFilter specifies query parameters for listing audit events.
@@ -296,11 +317,13 @@ func (s *Postgres) batchInsert(ctx context.Context, events []audit.Event, receip
 		WHERE ROW(incoming.service, incoming.actor, incoming.action,
 		 incoming.target_type, incoming.target_id, incoming.scope_type, incoming.scope_id,
 		 incoming.before_state, incoming.after_state, incoming.metadata,
-		 incoming.request_id, incoming.client_ip, incoming.created_at)
+		 incoming.request_id, incoming.client_ip, incoming.created_at,
+		 incoming.caller, incoming.origin_caller, incoming.operation_id, incoming.parent_operation_id, incoming.trace_id)
 		IS DISTINCT FROM ROW(stored.service, stored.actor, stored.action,
 		 stored.target_type, stored.target_id, stored.scope_type, stored.scope_id,
 		 stored.before_state, stored.after_state, stored.metadata,
-		 stored.request_id, stored.client_ip, stored.created_at)`+receiptConflict+`
+		 stored.request_id, stored.client_ip, stored.created_at,
+		 stored.caller, stored.origin_caller, stored.operation_id, stored.parent_operation_id, stored.trace_id)`+receiptConflict+`
 		LIMIT 1`).Scan(&conflictingID)
 	if err == nil {
 		return &EventConflictError{ID: conflictingID}
@@ -315,7 +338,7 @@ func (s *Postgres) batchInsert(ctx context.Context, events []audit.Event, receip
 }
 
 func (s *Postgres) batchInsertMultiRow(ctx context.Context, tx pgx.Tx, events []audit.Event) error {
-	const colsPerRow = 14
+	colsPerRow := len(copyFromColumns)
 	var sb strings.Builder
 	sb.WriteString(`INSERT INTO pg_temp.audit_event_batch (` + strings.Join(copyFromColumns, ", ") + `) VALUES `)
 	args := make([]any, 0, len(events)*colsPerRow)
@@ -340,6 +363,7 @@ func (s *Postgres) batchInsertMultiRow(ctx context.Context, tx pgx.Tx, events []
 			nullableJSON(e.BeforeState), nullableJSON(e.AfterState), nullableJSON(e.Metadata),
 			e.RequestID, e.ClientIP,
 			e.CreatedAt,
+			callerValue(e.Caller), callerValue(e.OriginCaller), e.OperationID, e.ParentOperationID, e.TraceID,
 		)
 	}
 	_, err := tx.Exec(ctx, sb.String(), args...)
@@ -361,6 +385,7 @@ func (s *Postgres) batchInsertCopyFrom(ctx context.Context, tx pgx.Tx, events []
 				nullableJSON(e.BeforeState), nullableJSON(e.AfterState), nullableJSON(e.Metadata),
 				e.RequestID, e.ClientIP,
 				e.CreatedAt,
+				callerValue(e.Caller), callerValue(e.OriginCaller), e.OperationID, e.ParentOperationID, e.TraceID,
 			}, nil
 		}),
 	)
@@ -510,7 +535,8 @@ func (s *Postgres) List(ctx context.Context, filter *ListFilter) (*ListResult, e
 
 	whereSQL, args := buildWhere(filter, true)
 	query := `SELECT id, service, ` + auditCategoryExpr + ` AS category, actor, action, target_type, target_id, scope_type, scope_id,
-	                  before_state, after_state, metadata, request_id, client_ip, created_at
+	                  before_state, after_state, metadata, request_id, client_ip, created_at,
+	                  caller, origin_caller, operation_id, parent_operation_id, trace_id
 	           FROM audit_events` + whereSQL
 	query += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d", len(args)+1)
 	args = append(args, limit+1)
@@ -526,7 +552,8 @@ func (s *Postgres) List(ctx context.Context, filter *ListFilter) (*ListResult, e
 		var e Event
 		if err := rows.Scan(&e.ID, &e.Service, &e.Category, &e.Actor, &e.Action, &e.TargetType, &e.TargetID,
 			&e.ScopeType, &e.ScopeID, &e.BeforeState, &e.AfterState, &e.Metadata,
-			&e.RequestID, &e.ClientIP, &e.CreatedAt); err != nil {
+			&e.RequestID, &e.ClientIP, &e.CreatedAt,
+			&e.Caller, &e.OriginCaller, &e.OperationID, &e.ParentOperationID, &e.TraceID); err != nil {
 			return nil, fmt.Errorf("scanning audit event: %w", err)
 		}
 		events = append(events, e)
