@@ -1,5 +1,13 @@
 # csar-audit Agent Summary
 
+## W1 caller receivers (source only)
+
+Migration 005 adds nullable caller/origin and operation/trace columns without
+classifying historical rows. HTTP/gRPC/AMQP, INSERT/COPY, replay checks and raw
+query responses preserve them; Actor is unchanged. Proto decoding reuses the
+shared core binding. Archive readers/projections must upgrade in the following
+PR before producer activation; source changes do not apply production DDL.
+
 ## Temporary PG migration mode (October9 source)
 - Startup-only `database.ingest_only`, default false, accepts confirmed
   RabbitMQ receipts with no PG pool, migrations, consumer, archive or PG probe.
