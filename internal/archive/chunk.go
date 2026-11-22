@@ -20,10 +20,11 @@ import (
 )
 
 const (
-	SchemaVersion      = 1
-	MaxChunkBytes      = 32 << 20
-	MaxCompressedBytes = 33 << 20
-	MaxChunkRows       = 100_000
+	SchemaVersion       = 1
+	callerSchemaVersion = 2
+	MaxChunkBytes       = 32 << 20
+	MaxCompressedBytes  = 33 << 20
+	MaxChunkRows        = 100_000
 )
 
 // Record keeps the canonical event intact. Historical receipt times may be unknown.
@@ -109,7 +110,7 @@ func Encode(ctx context.Context, w io.Writer, records []Record) (Chunk, error) {
 // Verify validates the complete chunk before returning importable records.
 // Bounded buffering prevents callers from importing a prefix of a corrupt object.
 func Verify(ctx context.Context, r io.Reader, expected *Chunk) ([]Record, error) {
-	if expected == nil || expected.SchemaVersion != SchemaVersion || expected.Rows < 1 || expected.Rows > MaxChunkRows ||
+	if expected == nil || !supportedSchema(expected.SchemaVersion) || expected.Rows < 1 || expected.Rows > MaxChunkRows ||
 		expected.UncompressedBytes < 1 || expected.UncompressedBytes > MaxChunkBytes ||
 		expected.CompressedBytes < 1 || expected.CompressedBytes > MaxCompressedBytes {
 		return nil, errors.New("invalid archive descriptor bounds/version")
@@ -188,6 +189,13 @@ func describe(records []Record) (Chunk, error) {
 	seen := make(map[string]struct{}, len(records))
 	for i := range records {
 		record := &records[i]
+		e := &record.Event
+		if e.Caller != nil || e.OriginCaller != nil || e.OperationID != "" || e.ParentOperationID != "" || e.TraceID != "" {
+			if err := audit.ValidateEvent(e); err != nil {
+				return Chunk{}, err
+			}
+			descriptor.SchemaVersion = callerSchemaVersion
+		}
 		if len(record.Event.ID) != 36 || strings.ToLower(record.Event.ID) != record.Event.ID || record.Event.CreatedAt.IsZero() {
 			return Chunk{}, errors.New("archive requires canonical ID and timestamp")
 		}
@@ -224,6 +232,10 @@ func describe(records []Record) (Chunk, error) {
 	slices.Sort(ids)
 	descriptor.EventIDsSHA256 = digest([]byte(strings.Join(ids, "\n") + "\n"))
 	return descriptor, nil
+}
+
+func supportedSchema(version int) bool {
+	return version == SchemaVersion || version == callerSchemaVersion
 }
 
 func digest(body []byte) string { sum := sha256.Sum256(body); return hex.EncodeToString(sum[:]) }
