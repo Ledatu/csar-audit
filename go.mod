@@ -5,8 +5,8 @@ go 1.25.0
 require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/ledatu/csar-core v0.1.48-0.20261121191331-e5edf071763e
-	github.com/ledatu/csar-proto v0.1.6-0.20261121190525-036c52b2db12
+	github.com/ledatu/csar-core v0.1.48-0.20261122144751-6ddd55607fda
+	github.com/ledatu/csar-proto v0.1.6-0.20261122144432-05946ddf33f1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rabbitmq/amqp091-go v1.10.0
 	go.opentelemetry.io/otel v1.43.0
