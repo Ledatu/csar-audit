@@ -8,7 +8,7 @@ require (
 	github.com/ledatu/csar-core v0.1.48-0.20261122144751-6ddd55607fda
 	github.com/ledatu/csar-proto v0.1.6-0.20261122144432-05946ddf33f1
 	github.com/prometheus/client_golang v1.23.2
-	github.com/rabbitmq/amqp091-go v1.10.0
+	github.com/rabbitmq/amqp091-go v1.14.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/trace v1.43.0
 	google.golang.org/grpc v1.81.1
