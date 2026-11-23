@@ -23,6 +23,7 @@ import (
 	"github.com/ledatu/csar-audit/internal/rmq"
 	"github.com/ledatu/csar-core/configload"
 	"github.com/ledatu/csar-core/gatewayctx"
+	"github.com/ledatu/csar-core/grpcserver"
 	"github.com/ledatu/csar-core/health"
 	"github.com/ledatu/csar-core/httpmiddleware"
 	"github.com/ledatu/csar-core/httpserver"
@@ -297,15 +298,8 @@ func run(sf *configload.SourceFlags, otlpEndpoint string, otlpInsecure bool, log
 
 	appCancel()
 
-	grpcDone := make(chan struct{})
-	go func() {
-		grpcServer.GracefulStop()
-		close(grpcDone)
-	}()
-	select {
-	case <-grpcDone:
-	case <-shutdownCtx.Done():
-		grpcServer.Stop()
+	if err := grpcserver.Shutdown(shutdownCtx, grpcServer); err != nil {
+		logger.Warn("gRPC shutdown forced at deadline", "error", err)
 	}
 
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {

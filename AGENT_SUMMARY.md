@@ -1,5 +1,9 @@
 # csar-audit Agent Summary
 
+The existing30s shutdown deadline now uses csar-core/grpcserver for bounded
+graceful/forced gRPC stop. Pipeline, HTTP drain, schema and ingestion semantics
+are unchanged; the generic lifecycle mechanism is shared with coordinator.
+
 Caller-aware archives use schema 2 and retain new columns through planning and
 restore. Schema 1 legacy payload bytes/checksums stay unchanged; readers accept
 both versions with manifest/chunk agreement. Upgrade archive readers/workers
