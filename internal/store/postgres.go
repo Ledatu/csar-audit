@@ -161,6 +161,17 @@ type Event struct {
 
 // ListFilter specifies query parameters for listing audit events.
 type ListFilter struct {
+	Initiator         IdentityFilter
+	Caller            IdentityFilter
+	OriginCaller      IdentityFilter
+	EventID           string
+	OperationID       string
+	ParentOperationID string
+	TraceID           string
+	ReleaseEventID    string
+	CacheStatus       string
+	AuditPhase        string
+
 	ScopeType         string
 	ScopeID           string
 	Service           string
@@ -183,6 +194,9 @@ type ListFilter struct {
 
 // ListResult holds a page of audit events with an optional next cursor.
 type ListResult struct {
+	FilterContract string               `json:"filter_contract,omitempty"`
+	Window         *InvestigationWindow `json:"window,omitempty"`
+
 	Events     []Event `json:"events"`
 	NextCursor string  `json:"next_cursor,omitempty"`
 }
@@ -208,6 +222,9 @@ type Group struct {
 
 // GroupResult is returned by the grouped investigation endpoint.
 type GroupResult struct {
+	FilterContract string               `json:"filter_contract,omitempty"`
+	Window         *InvestigationWindow `json:"window,omitempty"`
+
 	Groups []Group `json:"groups"`
 }
 
@@ -516,6 +533,7 @@ func buildWhere(filter *ListFilter, includeCursor bool) (string, []any) {
 	builder.addEqual("target_type", filter.TargetType)
 	builder.addEqual("target_id", filter.TargetID)
 	builder.addEqual("request_id", filter.RequestID)
+	builder.addInvestigation(filter)
 	builder.addNotIn(categoryColumn, filter.ExcludeCategories)
 	builder.addNotIn("service", filter.ExcludeServices)
 	builder.addNotIn("action", filter.ExcludeActions)
