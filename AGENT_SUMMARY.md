@@ -1,5 +1,13 @@
 # csar-audit Agent Summary
 
+Batch staging projects only this writer's explicit columns plus received_at,
+without copying destination NOT NULL constraints/defaults. New additive columns
+with defaults no longer break an older compatible writer's staging table.
+Native PG tests cover single/COPY51 and exact replay with an unrecognised NOT
+NULL DEFAULT column, alongside restore receipt and caller tests. This cannot
+retroactively fix already published writers that still use LIKE; their rollout
+must account for that limitation before applying a schema expansion.
+
 The existing30s shutdown deadline now uses csar-core/grpcserver for bounded
 graceful/forced gRPC stop. Pipeline, HTTP drain, schema and ingestion semantics
 are unchanged; the generic lifecycle mechanism is shared with coordinator.
