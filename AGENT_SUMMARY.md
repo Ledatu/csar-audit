@@ -1,3 +1,15 @@
+## Caller investigation query contract —November24 source
+
+List and groups share service-owned exact filters for initiator (origin otherwise
+caller), caller and origin, all10 identity fields, operation/parent/trace/event/
+receipt IDs, cache and audit phase. unknown and absent remain distinct; no Actor
+or transport inference. Responses advertise caller-v1 and effective window.
+New investigations default24h, max31days, cancel10s; legacy searches unchanged.
+Invalid/duplicate/unknown identity filters fail400. No DDL/index/dependency change.
+Native local PG tests cover list/group parity, direct-child/receipt matching,
+legacy/unknown separation and cursor continuation. Publish compatible backend
+before Admin UI; this source change does not authorize deployment.
+
 # csar-audit Agent Summary
 
 Batch staging projects only this writer's explicit columns plus received_at,

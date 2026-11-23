@@ -40,6 +40,36 @@ original unacknowledged. Unrelated valid events can still commit.
 auth and `admin.audit.read` authz. Supports cursor-based pagination, filtering
 by scope, actor, action, target, service, request ID, and time range.
 
+## Identity investigation filters
+
+`GET /admin/audit` and `/admin/audit/groups` accept the same exact-match criteria.
+Responses advertise `filter_contract: "caller-v1"`; clients using these criteria
+must check the marker rather than display broad results from older servers.
+
+For each prefix `initiator_`, `caller_`, `origin_caller_`, supported suffixes are
+`kind`, `id`, `owner_subject`, `effective_subject`, `credential_kind`,
+`credential_id`, `client_id`, `connection_id`, `assurance`, `version`.
+Initiator means persisted origin when present, otherwise persisted caller. Neither
+legacy Actor nor transport determines identity. `kind=unknown` is the recorded
+legacy identity; `kind=absent` means no recorded kind and is a separate filter.
+Other exact criteria: `event_id`, `operation_id`, `parent_operation_id`, `trace_id`,
+`release_event_id`, `cache_status`, `audit_phase`. The receipt filter matches its
+own event ID and final outcomes referencing that receipt. Parent operation matches
+only direct children; it is not recursive chain expansion. All criteria combine
+with AND and existing scope/action/category/status/exclusion filters.
+
+An investigation defaults to the24h ending at `until` (or now); explicit periods
+must be ordered and at most31days. The response `window` reports effective bounds.
+New investigations have a10s query context. Invalid, ambiguous or unknown identity
+criteria return400. Existing queries without these criteria retain their behavior.
+No index or migration is introduced: operators should narrow periods for large
+histories; statement cancellation bounds expensive scans. Index design requires
+separate measurements before production activation.
+
+Deploy this backend before the compatible Admin UI. UI unsupported-contract checks
+prevent silently ignored filters during mixed versions. Authorization, ingest,
+writer/replay behavior, Rabbit and Redis contracts are unchanged.
+
 ## Ports
 
 | Port | Protocol | Purpose |
