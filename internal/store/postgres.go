@@ -269,10 +269,12 @@ func (s *Postgres) batchInsert(ctx context.Context, events []audit.Event, receip
 		return fmt.Errorf("begin audit batch: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// No indexes/defaults: this table only holds the incoming values for the
-	// current transaction, including repeated IDs within one delivery batch.
+	columns := strings.Join(copyFromColumns, ", ")
+	// Project only columns this writer supplies, without destination constraints.
+	// LIKE would copy a newer NOT NULL column but not its default, breaking old
+	// writers during an otherwise compatible additive migration.
 	if _, err := tx.Exec(ctx, `CREATE TEMP TABLE audit_event_batch
-		(LIKE audit_events) ON COMMIT DROP`); err != nil {
+		ON COMMIT DROP AS SELECT `+columns+`, received_at FROM audit_events WITH NO DATA`); err != nil {
 		return fmt.Errorf("create audit batch staging: %w", err)
 	}
 	if len(events) > copyFromThreshold {
@@ -283,7 +285,6 @@ func (s *Postgres) batchInsert(ctx context.Context, events []audit.Event, receip
 	if err != nil {
 		return err
 	}
-	columns := strings.Join(copyFromColumns, ", ")
 	if restoring {
 		if _, err := tx.Exec(ctx, `CREATE TEMP TABLE audit_restore_receipts(id uuid,received_at timestamptz) ON COMMIT DROP`); err != nil {
 			return fmt.Errorf("create restore receipt staging: %w", err)
