@@ -1,3 +1,11 @@
+## Uniform caller envelope compatibility — source only
+
+Pins merged Core34bbe3cf so verified caller/origin envelopes can carry bounded
+HTTPS client metadata identifiers without service-local validation copies.
+Identity, ownership, tenant authorization and credential audiences retain their
+existing checks. This is a receiver compatibility prerequisite before enabling
+automatic MCP onboarding; it changes no route, feature flag or deployment.
+
 ## Caller investigation query contract —November24 source
 
 List and groups share service-owned exact filters for initiator (origin otherwise
