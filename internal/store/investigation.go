@@ -43,7 +43,11 @@ func (f *IdentityFilter) active() bool {
 }
 func (f *IdentityFilter) validate(prefix string) error {
 	for _, field := range f.fields() {
-		if !caller.ValidReference(field.Value) {
+		valid := caller.ValidReference(field.Value)
+		if field.Name == "client_id" {
+			valid = caller.ValidClientID(field.Value)
+		}
+		if !valid {
 			return fmt.Errorf("%s_%s: invalid reference", prefix, field.Name)
 		}
 	}

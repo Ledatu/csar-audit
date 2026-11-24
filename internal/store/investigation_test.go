@@ -40,12 +40,41 @@ func TestInvestigationPredicatesAreParameterized(t *testing.T) {
 	}
 }
 
+func TestInvestigationAcceptsSharedMetadataClientIdentifiers(t *testing.T) {
+	clientID := "https://client.example/" + strings.Repeat("a", 900) + "/client.json"
+	for _, f := range []*ListFilter{
+		{Caller: IdentityFilter{ClientID: clientID}},
+		{OriginCaller: IdentityFilter{ClientID: clientID}},
+		{Initiator: IdentityFilter{ClientID: clientID}},
+	} {
+		if err := f.ValidateInvestigation(time.Now()); err != nil {
+			t.Fatal("valid metadata client cannot be investigated", err)
+		}
+		where, args := buildWhere(f, false)
+		found := false
+		for _, arg := range args {
+			if value, ok := arg.(string); ok && value == clientID {
+				found = true
+			}
+		}
+		if strings.Contains(where, clientID) || !found {
+			t.Fatal("metadata client filter was not parameterized")
+		}
+	}
+	for _, id := range []string{"http://client.example/client.json", "https://client.example/" + strings.Repeat("a", 1100), "https://client.example/client.json?token=secret"} {
+		if (&ListFilter{Caller: IdentityFilter{ClientID: id}}).ValidateInvestigation(time.Now()) == nil {
+			t.Fatal("invalid metadata identifier accepted")
+		}
+	}
+}
+
 func TestInvestigationNativeIdentityAndGroupParity(t *testing.T) {
 	s := integrationStore(t)
 	ctx := context.Background()
 	events := integrationEvents(t, 6)
+	clientID := "https://client.example/" + strings.Repeat("a", 900) + "/client.json"
 	service := &caller.Identity{Version: 1, CallerKind: caller.Service, CallerID: "svc:api", EffectiveSubject: "svc:api", CredentialKind: caller.STS, Assurance: caller.Verified}
-	agent := &caller.Identity{Version: 1, CallerKind: caller.Agent, CallerID: "agent:1", OwnerSubject: "owner", EffectiveSubject: "owner", CredentialKind: caller.APIKey, CredentialID: "key:1", ClientID: "client:1", ConnectionID: "connection:1", Assurance: caller.Verified}
+	agent := &caller.Identity{Version: 1, CallerKind: caller.Agent, CallerID: "agent:1", OwnerSubject: "owner", EffectiveSubject: "owner", CredentialKind: caller.APIKey, CredentialID: "key:1", ClientID: clientID, ConnectionID: "connection:1", Assurance: caller.Verified}
 	unknown := &caller.Identity{Version: 1, CallerKind: caller.Unknown, EffectiveSubject: "owner", OwnerSubject: "owner", CredentialKind: caller.APIKey, CredentialID: "legacy:key", Assurance: caller.Legacy}
 	events[0].Caller, events[0].OriginCaller = service, agent
 	events[0].OperationID, events[0].ParentOperationID, events[0].TraceID = "operation:1", "root:1", "trace:1"
@@ -71,7 +100,8 @@ func TestInvestigationNativeIdentityAndGroupParity(t *testing.T) {
 		{"unknown is not missing", ListFilter{Initiator: IdentityFilter{Kind: "unknown"}}, 2},
 		{"missing is not inferred", ListFilter{Initiator: IdentityFilter{Kind: "absent"}}, 1},
 		{"origin absent", ListFilter{OriginCaller: IdentityFilter{Kind: "absent"}}, 3},
-		{"all initiator fields", ListFilter{Initiator: IdentityFilter{Version: "1", Kind: "agent", ID: "agent:1", OwnerSubject: "owner", EffectiveSubject: "owner", CredentialKind: "api_key", CredentialID: "key:1", ClientID: "client:1", ConnectionID: "connection:1", Assurance: "verified"}}, 2},
+		{"all initiator fields", ListFilter{Initiator: IdentityFilter{Version: "1", Kind: "agent", ID: "agent:1", OwnerSubject: "owner", EffectiveSubject: "owner", CredentialKind: "api_key", CredentialID: "key:1", ClientID: clientID, ConnectionID: "connection:1", Assurance: "verified"}}, 2},
+		{"origin metadata client", ListFilter{OriginCaller: IdentityFilter{ClientID: clientID}}, 2},
 		{"caller and origin", ListFilter{Caller: IdentityFilter{ID: "svc:api"}, OriginCaller: IdentityFilter{ID: "agent:1"}}, 2},
 		{"operation", ListFilter{OperationID: "operation:1"}, 2},
 		{"parent", ListFilter{ParentOperationID: "root:1"}, 2},
